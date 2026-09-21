@@ -1,0 +1,158 @@
+# =============================================================================
+# 实验矩阵：P1 引擎与量化对比
+#
+# 设计纪律（§5.9）：
+#   1. **每个 run 只改一个变量**；`overrides` 里出现的每个 key 都会被记录进报告，
+#      以便复核"到底改了什么"。
+#   2. 所有 run 共用同一批 `cases`（同 prompt / 同输出上限 / 同解码参数），
+#      否则跨引擎的延迟-吞吐数字不可比。
+#   3. 每个 run 重复 `repeats` 次并给 P50/P99 —— 单次测量不构成结论。
+#
+# 本文件只引用**引擎名**与**少量覆盖项**；引擎的运行参数在 configs/engines/*.yaml，
+# 不在本文件重复（重复 = 迟早不一致）。
+# =============================================================================
+
+experiment:
+  id: p1
+  description: "P1 推理引擎与量化等级同条件对比"
+  warmup: 1
+  repeats: 3
+  # 强制串行：GPU 是独占资源，并发会互相污染测量（§4.4）
+  serial: true
+
+# -----------------------------------------------------------------------------
+# 用例：跨引擎完全一致。中立消息格式在此用声明式方式表达。
+# -----------------------------------------------------------------------------
+cases:
+  - id: text_short
+    kind: text
+    prompt: "用一句话解释什么是雷达。"
+
+  - id: text_open
+    kind: text
+    prompt: "SAR 和普通雷达的主要区别是什么？"
+    # 开放式长答：实测 HF 侧会写 974 token 才自然停止（P0），
+    # 因此它是测**长输出 decode 性能**的关键用例，也是最耗时的那个。
+
+  - id: vl_rdmap
+    kind: vision
+    image: "${paths.reports}/p0_synthetic_rd_map.png"
+    prompt: "这张图里有什么？请描述坐标轴标签和曲线形状。"
+
+# -----------------------------------------------------------------------------
+# 视觉能力回归（量化掉点的任务级判据，**不用困惑度**，§5.5）
+# 合成图的真值写死在 src/vl_probe.py，模型不可能"猜中"，因此可以客观判分。
+# -----------------------------------------------------------------------------
+vision_regression:
+  enabled: true
+  image: "${paths.reports}/p0_synthetic_rd_map.png"
+  prompt: "这张图里有什么？请描述坐标轴标签和曲线形状。"
+  # 必须全部命中才算"视觉能力未退化"
+  required_terms:
+    - "Range"
+    - "Doppler"
+    - "km"
+    - "Hz"
+  # 目标数量：真值 3 个；接受中英文表述
+  target_count_terms: ["3", "三", "three"]
+  # 轴范围：真值 0–100 km 与 −500–500 Hz
+  range_terms: ["100", "500"]
+
+# -----------------------------------------------------------------------------
+# 实验分组
+#   enabled: false 的分组**不执行**，其依赖的模型文件也未被下载 —— 保持诚实，
+#   不把"没跑"伪装成"跑了但没效果"。
+# -----------------------------------------------------------------------------
+groups:
+
+  # ===== E1：引擎对比（零额外下载，使用已就位的 HF 权重 + Q4_K_M GGUF）=====
+  - id: E1_engine
+    description: "HF bf16 vs llama.cpp Q4_K_M · 同 prompt 同解码参数"
+    enabled: true
+    runs:
+      - label: "hf-bf16-sdpa"
+        engine: hf
+        overrides: {}
+      - label: "llamacpp-q4km-vulkan0"
+        engine: llamacpp
+        overrides: {}
+
+  # ===== E2：量化等级（需额外下载 Q8_0 / Q6_K，约 3.3 GB）=====
+  - id: E2_quant
+    description: "llama.cpp 内不同量化等级的质量-速度权衡"
+    enabled: false          # ← 待用户批准额外下载后开启
+    requires_extra_download: true
+    runs:
+      - label: "llamacpp-q8_0"
+        engine: llamacpp
+        overrides:
+          model.llm_path: "${paths.models_gguf}/Qwen3VL-2B-Instruct-Q8_0.gguf"
+      - label: "llamacpp-q4km"
+        engine: llamacpp
+        overrides:
+          model.llm_path: "${paths.models_gguf}/Qwen3VL-2B-Instruct-Q4_K_M.gguf"
+
+  # ===== E3：mmproj 精度（需额外下载 mmproj Q8_0，约 0.45 GB）=====
+  - id: E3_mmproj
+    description: "视觉投影器 F16 vs Q8_0 · 视觉能力是否退化"
+    enabled: false
+    requires_extra_download: true
+    runs:
+      - label: "mmproj-f16"
+        engine: llamacpp
+        overrides:
+          model.mmproj_path: "${paths.models_gguf}/mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+      - label: "mmproj-q8_0"
+        engine: llamacpp
+        overrides:
+          model.mmproj_path: "${paths.models_gguf}/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf"
+
+  # ===== E4：GPU 卸载层数（零额外下载）=====
+  - id: E4_ngl
+    description: "GPU 层数对延迟/吞吐的影响（验证是否真的全放 GPU 最好）"
+    enabled: false          # ← 与 E1 共用同一 GGUF，可随时开启
+    runs:
+      - label: "ngl-99"
+        engine: llamacpp
+        overrides:
+          server.n_gpu_layers: 99
+      - label: "ngl-0-cpu"
+        engine: llamacpp
+        overrides:
+          server.n_gpu_layers: 0
+
+  # ===== E5：KV Cache 量化（零额外下载）=====
+  - id: E5_kvquant
+    description: "KV Cache f16 vs q8_0 · 省显存换并发的代价"
+    enabled: false
+    runs:
+      - label: "kv-f16"
+        engine: llamacpp
+        overrides:
+          server.cache_type_k: null
+          server.cache_type_v: null
+      - label: "kv-q8_0"
+        engine: llamacpp
+        overrides:
+          server.cache_type_k: "q8_0"
+          server.cache_type_v: "q8_0"
+
+  # ===== D1：EOS 集合隔离实验（零额外下载）=====
+  # 背景（P1 复盘）：E1 里 text_open 的输出长度 HF=974 / llama.cpp=465 token，
+  # 两者都没触顶。查明的原因是**两边的结束符集合不同**：
+  #   HF  `generation_config.json`: eos_token_id = [151645, 151643]   ← 两个
+  #   GGUF `tokenizer.ggml.eos_token_id`                       = 151645    ← 一个
+  # 本组把 HF 的 EOS 收紧到与 GGUF 一致，看输出长度是否随之变化：
+  #   · 若长度变化 → 证明 EOS 集合差异是长度差异的主因（且方向为"HF 被更多 EOS 提前停"）
+  #   · 若无变化   → 说明长度差异另有原因（更可能是量化本身改变分布），需再用 F16 GGUF 分离
+  - id: D1_eos_isolation
+    description: "只改 HF 的 eos_token_id 集合，与 GGUF 对齐，验证 EOS 是否是长度差异主因"
+    enabled: false
+    runs:
+      - label: "hf-eos-default"
+        engine: hf
+        overrides: {}
+      - label: "hf-eos-single-151645"
+        engine: hf
+        overrides:
+          generation.eos_token_id: [151645]   # 与 GGUF 的 tokenizer.ggml.eos_token_id 一致

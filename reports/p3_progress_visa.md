@@ -1,0 +1,125 @@
+# P3 出题进度汇总（主对话核验）
+
+> 由 `scripts/p3_audit_units.py` 自动生成 —— **不要手改**。
+
+## 一、各单元
+
+| 单元文件 | 条数 | id 范围 | 题型分布 | 缺 evidence | quote 未命中 |
+|---|---|---|---|---|---|
+| `p2_alltasks_v1.yaml` | 24 | txt_000301–vis_000304 | calc×7 / concept×3 / term×3 / choice×2 / unanswerable×2 / regime_trap×1 / contrast×1 / clarify×1 / figure_qa×1 / readout×1 / trend×1 / compare×1 | 1 | **0** |
+| `p2_pdf_v0.yaml` | 10 | txt_000101–txt_000110 | calc×3 / concept×2 / choice×1 / term×1 / regime_trap×1 / contrast×1 / unanswerable×1 | 1 | **0** |
+| `p3_ch01a_v0.yaml` | 21 | txt_001051–txt_001070 | concept×9 / term×6 / choice×3 / regime_trap×2 / unanswerable×1 | 1 | **0** |
+| `p3_ch01b_v0.yaml` | 21 | txt_001072–txt_001092 | term×6 / concept×6 / choice×6 / regime_trap×2 / unanswerable×1 | 1 | **0** |
+| `p3_ch02a_v0.yaml` | 14 | txt_000411–txt_000422 | calc×5 / concept×5 / choice×2 / term×1 / unanswerable×1 | 1 | **0** |
+| `p3_ch02b_v0.yaml` | 36 | txt_000425–txt_000460 | calc×23 / concept×6 / choice×4 / term×2 / clarify×1 | 0 | **0** |
+| `p3_ch02c_v0.yaml` | 30 | txt_000461–txt_000490 | concept×13 / calc×9 / term×4 / choice×3 / clarify×1 | 0 | **0** |
+| `p3_ch02d_v0.yaml` | 32 | txt_000401–txt_000512 | calc×13 / concept×6 / contrast×6 / regime_trap×4 / unanswerable×3 | 3 | **0** |
+| `p3_ch02e_v0.yaml` | 30 | txt_000513–txt_000542 | calc×13 / contrast×6 / unanswerable×5 / regime_trap×4 / choice×2 | 5 | **0** |
+| `p3_ch03a_v0.yaml` | 29 | txt_000941–txt_000969 | concept×15 / term×6 / choice×4 / regime_trap×3 / unanswerable×1 | 1 | **0** |
+| `p3_ch03b_v0.yaml` | 29 | txt_000970–txt_000998 | concept×16 / term×6 / choice×5 / regime_trap×2 | 0 | **0** |
+| `p3_ch04a_v0.yaml` | 31 | txt_000551–txt_000581 | calc×14 / concept×9 / regime_trap×6 / choice×1 / clarify×1 | 0 | **0** |
+| `p3_ch04b_v0.yaml` | 30 | txt_000582–txt_000611 | concept×10 / calc×8 / choice×6 / regime_trap×5 / clarify×1 | 0 | **0** |
+| `p3_ch04c_v0.yaml` | 28 | txt_000612–txt_000639 | calc×9 / concept×8 / term×3 / regime_trap×3 / choice×2 / contrast×1 / unanswerable×1 / clarify×1 | 1 | **0** |
+| `p3_ch05a_v0.yaml` | 36 | txt_000681–txt_000716 | calc×20 / concept×12 / unanswerable×4 | 4 | **0** |
+| `p3_ch05b_v0.yaml` | 30 | txt_000717–txt_000745 | concept×13 / choice×11 / term×4 / contrast×2 | 0 | **0** |
+| `p3_ch05c_v0.yaml` | 28 | txt_000747–txt_000774 | concept×11 / term×6 / choice×4 / calc×4 / contrast×1 / clarify×1 / unanswerable×1 | 1 | **0** |
+| `p3_ch05d_v0.yaml` | 14 | txt_000775–txt_000788 | contrast×6 / unanswerable×5 / regime_trap×3 | 5 | **0** |
+| `p3_ch06a_v0.yaml` | 30 | txt_000871–txt_000900 | choice×14 / concept×10 / term×6 | 0 | **0** |
+| `p3_ch06b_v0.yaml` | 30 | txt_000901–txt_000930 | concept×13 / term×6 / choice×5 / calc×3 / contrast×1 / clarify×1 / unanswerable×1 | 1 | **0** |
+| `p3_ch07a_v0.yaml` | 38 | txt_000791–txt_000828 | concept×13 / term×9 / contrast×6 / calc×4 / choice×4 / clarify×2 | 0 | **0** |
+| `p3_ch07b_v0.yaml` | 33 | txt_000829–txt_000861 | concept×23 / choice×3 / contrast×3 / term×3 / clarify×1 | 0 | **0** |
+| `p3_ch07c_v0.yaml` | 4 | txt_000862–txt_000865 | clarify×2 / unanswerable×1 / contrast×1 | 1 | **0** |
+| `p3_ch08a_v0.yaml` | 25 | txt_001001–txt_001025 | concept×9 / term×6 / calc×4 / choice×3 / contrast×2 / clarify×1 | 0 | **0** |
+| `p3_ch08b_v0.yaml` | 25 | txt_001026–txt_001050 | concept×10 / term×5 / choice×4 / calc×3 / contrast×1 / unanswerable×1 / clarify×1 | 1 | **0** |
+| `p3_ch09a_v0.yaml` | 33 | txt_001101–txt_001133 | choice×10 / term×8 / regime_trap×6 / concept×5 / contrast×2 / unanswerable×2 | 2 | **0** |
+| `p3_mm_doppler_a.yaml` | 25 | txt_001441–txt_001465 | calc×10 / regime_trap×6 / contrast×4 / choice×4 / unanswerable×1 | 1 | **0** |
+| `p3_mm_fmcw_a.yaml` | 29 | txt_001201–txt_001228 | calc×17 / term×4 / concept×4 / contrast×2 / clarify×2 | 0 | **0** |
+| `p3_mm_fmcw_b.yaml` | 29 | txt_001230–txt_001258 | calc×7 / regime_trap×7 / contrast×6 / choice×6 / unanswerable×3 | 3 | **0** |
+| `p3_mm_mimo_adv_a.yaml` | 26 | txt_001501–txt_001526 | regime_trap×8 / calc×6 / contrast×6 / choice×4 / unanswerable×2 | 2 | **0** |
+| `p3_mm_radeq_a.yaml` | 33 | txt_001381–txt_001413 | calc×11 / choice×9 / term×5 / regime_trap×5 / concept×1 / contrast×1 / unanswerable×1 | 1 | **0** |
+| `p3_mm_signalproc_a.yaml` | 33 | txt_001321–txt_001353 | calc×12 / regime_trap×8 / contrast×5 / choice×5 / unanswerable×3 | 3 | **0** |
+| `p3_mm_targetdet_a.yaml` | 30 | txt_001261–txt_001290 | concept×11 / term×7 / calc×5 / choice×4 / contrast×1 / unanswerable×1 / clarify×1 | 1 | **0** |
+| `p3_mm_targetdet_b.yaml` | 12 | txt_001291–txt_001302 | concept×6 / term×3 / choice×2 / clarify×1 | 0 | **0** |
+| `p3_vis_ch02_a.yaml` | 24 | vis_000401–vis_000424 | figure_qa×8 / readout×8 / trend×4 / compare×4 | 0 | **0** |
+| `sp_basics_v0.yaml` | 13 | txt_000001–txt_000013 | calc×5 / concept×2 / choice×1 / term×1 / unanswerable×1 / regime_trap×1 / contrast×1 / clarify×1 | 13 | **0** |
+
+**合计 945 条**（训练目标 1000）
+
+## 二、题型进度 vs 目标
+
+| 题型 | 已有 | 目标 | 缺口 | 完成度 |
+|---|---|---|---|---|
+| `calc` | 215 | 200 | +15 | 108% |
+| `concept` | 251 | 250 | +1 | 100% |
+| `term` | 111 | 110 | +1 | 101% |
+| `choice` | 134 | 130 | +4 | 103% |
+| `regime_trap` | 77 | 70 | +7 | 110% |
+| `contrast` | 66 | 60 | +6 | 110% |
+| `unanswerable` | 43 | 40 | +3 | 108% |
+| `clarify` | 20 | 20 | 0 | 100% |
+| 视觉 4 类 | 28 | 83 | 55 | 34% |
+
+## 三、分布
+
+### 3.1 体制（regime）—— `universal` 全局需 ≥30%
+
+- `universal` 467 (49%)
+- `airborne_pulse` 232 (25%)
+- `automotive_mmwave` 95 (10%)
+- `fmcw` 46 (5%)
+- `sar` 44 (5%)
+- `phased_array` 29 (3%)
+- `unspecified` 20 (2%)
+- `mimo` 12 (1%)
+
+### 3.2 问法（ask_style）—— 不能全是 explicit
+
+- `explicit` 572 (61%)
+- `parametric` 99 (10%)
+- `contrast` 93 (10%)
+- `implicit` 89 (9%)
+- `correct` 53 (6%)
+- `clarify` 20 (2%)
+- `None` 19 (2%)
+
+### 3.3 子方向（subdomain）—— 单个需 ≤40%
+
+- `detection` 125 (13%)
+- `ambiguity` 116 (12%)
+- `clutter` 106 (11%)
+- `pulse_compression` 102 (11%)
+- `array_processing` 95 (10%)
+- `doppler` 87 (9%)
+- `resolution` 85 (9%)
+- `radar_equation` 73 (8%)
+- `tracking` 64 (7%)
+- `imaging` 54 (6%)
+- `misc` 38 (4%)
+
+### 3.4 难度
+
+- `medium` 509 (54%)
+- `hard` 233 (25%)
+- `easy` 203 (21%)
+
+## 四、跨单元体检
+
+- **id 重复**：无
+- **题面重复**：无
+- **缺 evidence**：13 条 ⚠️（unanswerable 有 source 即豁免 —— 它本就无原文可引，依据在 notes）
+- **universal 占比**：49%（需 ≥30%）✓
+- **clarify 占比**：2.1%（需 ≤10%）✓
+
+### 4.5 `calc` 参数来源（⚠️ 必须取自 `configs/param_pool.yaml` 的 `train` 半边）
+
+- 取自 `train` 半边：**215** 条 ✓
+- 取了 `eval` 半边：**0** 条
+- 不在参数池（硬写）：**0** 条
+- 公式名不在参数池：**0** 条
+
+## 五、⭐ 证据核验（quote 是否真在语料里）
+
+框架的校验器**只检查 quote 字段存在、不检查它是不是真的语料原文** —— 编造出处会静默通过。
+本节把每条 quote 拿回语料全文搜索（归一化去空格/标点后比对）。
+
+**全部命中 ✓**（932 条带 quote 的题都在语料里找到了原文）

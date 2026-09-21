@@ -1,0 +1,20 @@
+# =============================================================================
+# 引擎配置：hf（HuggingFace transformers）
+# 只放**本引擎独有**的运行参数。路径与生成默认值见 configs/base.yaml。
+# 定位：训练 / 评测 / 对照基线（唯一能做 LoRA 与 RAGAS 的引擎）
+# =============================================================================
+
+engine:
+  name: hf
+  display: "HuggingFace transformers"
+
+model:
+  # 路径不在这里写 —— 由 base.yaml 的 paths.model_base_dir 注入
+  dtype: "bfloat16"           # sm_89 原生支持 bf16，无需 GradScaler
+  device: "cuda"
+  # 注意力实现：本机未编译 flash-attn，可选 sdpa / eager。
+  # 加载失败时 modeling.load_model 会自动回退，并把**实际生效值**记录进 info()。
+  attn_implementation: "sdpa"
+
+# 本引擎对 base.yaml generation 段的覆盖（留空 = 完全继承）
+generation: {}

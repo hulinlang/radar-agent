@@ -1,0 +1,78 @@
+# =============================================================================
+# P6 Agent 配置（参数唯一来源）
+#
+# 分层铁律：`src/` 里的 `DEFAULTS` 只是**容器**，真正的值在这里。
+#   scripts 层读本文件 → 注入 `xxx.DEFAULTS.update(...)`。
+#   代码里不再出现第二个默认值，避免"改了一处另一处没改"。
+#
+# 阈值来源：规划 `~/.workbuddy/plans/cosmic-aurora-babbage-YJKmZJAL.md` §6.3。
+# ⚠️ 每个阈值都要配套**计数器**（见 react 循环），否则不知道护栏有没有被触发。
+# =============================================================================
+
+# ---- ReAct 主循环 ----
+react:
+  max_steps: 6                 # 超过则强制进最终答案步 + 解码层屏蔽 <tool_call>
+  max_new_tokens_per_step: 256 # 单步生成上限
+  token_budget: 6000           # 累计 token 预算，超了终止
+  wall_clock_s: 90             # 全局墙钟上限
+  # ⚠️ 2026-09-21 由 True 改为 **false**（原默认值在 `react.py` 的 DEFAULTS 里）。
+  #    两条理由：
+  #    ① 微调后不需要了 —— tool5 在**不给任何示例**时格式合规率已达 98.3%；
+  #    ② 给示例有副作用 —— 实测它会让模型对**所有题都调工具**（含常识题），
+  #       即"万物皆工具"退化，而 tool5 恰恰把常识题误调修回了 0%。
+  #    ⭐ 对 P7 端到端评测尤其关键：B 组（有工具）必须与 A/C/D 组**提示词条件一致**，
+  #       否则"检索的净收益"里会混进"多给了两个示例"的贡献，结论不可信。
+  fewshot: false
+
+# ---- 护栏（每条都要有计数器）----
+guard:
+  dup_call: true               # 同一 (工具名, 规范化参数) 调过就不再执行
+  loop_detect: true            # 连续 2 步 thought 的 4-gram Jaccard >0.90 → 强制收尾
+  loop_jaccard: 0.90
+  step_timeout_s: 10           # 单步超时（web 15s）
+  web_timeout_s: 15
+  empty_retrieval_retry: 1     # 空检索允许换 query 重试次数
+
+# ---- 工具开关 ----
+# ⚠️ web_search 默认**关**：联网会引入幻觉 + 撞 D8 语料外发红线。
+#    模型看不见就不会调，比"让它调了再报错"更省 token 也更可控。
+tools:
+  corpus_search: true
+  calc: true                 # 2026-09-21 由 formula_calc 改造：只收算术表达式
+  web_search: false
+
+tool_params:
+  corpus_search:
+    top_k: 5
+    max_chars: 700
+    top_n: 20
+    use_dense: true
+    use_refs: true
+    use_concepts: false        # P4-S2 实测负收益，保持关闭
+    min_sim: 0.55              # ⭐ 实测标定，见 corpus_search.py 注释（勿凭感觉改）
+  calc: {}
+  web_search:
+    mode: offline_snapshot     # offline_snapshot | live
+    top_k: 3
+
+# ---- 解析器 ----
+parser:
+  max_calls: 3                 # 一次回复最多执行几个调用
+  allow_repair: true           # 仅对「生成被截断在调用中间」补结束标签
+
+# ---- DAG 兜底（指标必须与 ReAct 主线分开报告，不得混合平均）----
+fallback:
+  enabled: true
+  max_rate: 0.20
+
+# ---- 零样本基线探针（P5b-5 的对比锚）----
+zeroshot:
+  # 从 eval_frozen.jsonl 里按 task 分层抽样。
+  # ⚠️ 必须**分层**而不是"取前 N 条"：评测集里 concept 排在最前（67 条），
+  #    只取前 N 条会导致样本里一条 calc 都没有 —— 而 calc 恰恰是工具调用收益最大的题型。
+  # ⚠️ 2 太小（每题型仅 2 条，calc 出现 1/2 与 11/12 两种结果的巨大波动）。
+  #    6 是"能看出题型差异又不至于跑太久"的折中：约 59 条 × 2 模式 ≈ 12 min。
+  sample_per_task: 6
+  max_new_tokens: 256
+  do_sample: false
+  seed: 42

@@ -1,0 +1,40 @@
+{"task": "commonsense", "messages": [{"role": "user", "content": "2 加 3 等于几？"}, {"role": "assistant", "content": "5。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "7 乘以 8 是多少？"}, {"role": "assistant", "content": "56。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "100 除以 4 等于多少？"}, {"role": "assistant", "content": "25。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "200 的 15% 是多少？"}, {"role": "assistant", "content": "30。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "1 公里等于多少米？"}, {"role": "assistant", "content": "1000 米。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "1 小时有多少秒？"}, {"role": "assistant", "content": "3600 秒。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "1 千克等于多少克？"}, {"role": "assistant", "content": "1000 克。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "0 摄氏度换算成华氏度是多少？"}, {"role": "assistant", "content": "32 华氏度。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "光在真空中的速度大约是多少？"}, {"role": "assistant", "content": "约 3×10^8 米/秒。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "水的沸点是多少摄氏度？"}, {"role": "assistant", "content": "标准大气压下是 100 摄氏度。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "一年有几个月？"}, {"role": "assistant", "content": "12 个月。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "一个星期有几天？"}, {"role": "assistant", "content": "7 天。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "人体正常体温大约是多少摄氏度？"}, {"role": "assistant", "content": "约 36.5 到 37 摄氏度。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "地球绕太阳公转一圈需要多久？"}, {"role": "assistant", "content": "约 365 天，即一年。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "中国的首都是哪里？"}, {"role": "assistant", "content": "北京。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "世界上最长的河流是哪条？"}, {"role": "assistant", "content": "通常认为是尼罗河，也有以亚马逊河为最长的说法。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "世界上最高的山峰是哪座？"}, {"role": "assistant", "content": "珠穆朗玛峰，海拔约 8848 米。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "太平洋是世界上第几大洋？"}, {"role": "assistant", "content": "第一大，是面积最大的洋。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "交通信号灯有哪几种颜色？"}, {"role": "assistant", "content": "红、黄、绿三种。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "红灯亮时车辆应该怎么做？"}, {"role": "assistant", "content": "应当停车等待，不得通行。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "“苹果”的英文单词怎么写？"}, {"role": "assistant", "content": "apple。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "“good morning” 翻译成中文是什么意思？"}, {"role": "assistant", "content": "早上好。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "“大”的反义词是什么？"}, {"role": "assistant", "content": "小。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "请说出三个中国的传统节日。"}, {"role": "assistant", "content": "春节、端午节、中秋节。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "计算机中的 1 字节等于多少位？"}, {"role": "assistant", "content": "8 位。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "二进制的 1010 转换成十进制是多少？"}, {"role": "assistant", "content": "10。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "HTTP 全称是什么？"}, {"role": "assistant", "content": "HyperText Transfer Protocol，超文本传输协议。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "CPU 的全称是什么？"}, {"role": "assistant", "content": "Central Processing Unit，中央处理器。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "RAM 断电后数据会保留吗？"}, {"role": "assistant", "content": "不会，RAM 是易失性存储器，断电后数据丢失。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "三角形的内角和是多少度？"}, {"role": "assistant", "content": "180 度。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "圆的面积公式是什么？"}, {"role": "assistant", "content": "S = πr²，其中 r 为半径。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "勾股定理描述的是什么关系？"}, {"role": "assistant", "content": "直角三角形中，两直角边平方和等于斜边平方，即 a²+b²=c²。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "什么是质数？"}, {"role": "assistant", "content": "大于 1 且只能被 1 和自身整除的自然数。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "哺乳动物有什么共同特征？"}, {"role": "assistant", "content": "用肺呼吸、体表被毛、恒温、胎生并以乳汁哺育幼崽。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "植物进行光合作用需要什么原料？"}, {"role": "assistant", "content": "主要是二氧化碳、水和光照。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "声音在空气中传播速度大约是多少？"}, {"role": "assistant", "content": "常温下约 340 米/秒。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "冰箱为什么能保鲜食物？"}, {"role": "assistant", "content": "低温抑制微生物繁殖并减慢化学反应，从而延长保质期。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "下雨天路面湿滑，行人应注意什么？"}, {"role": "assistant", "content": "放慢脚步、注意防滑、留意车辆并走人行道。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "请解释一下“亡羊补牢”的意思。"}, {"role": "assistant", "content": "出了问题后及时补救，还不算晚。"}]}
+{"task": "commonsense", "messages": [{"role": "user", "content": "如果明天气温是零下 5 度，出门需要穿什么？"}, {"role": "assistant", "content": "建议穿厚羽绒服、保暖内衣，并戴帽子手套。"}]}

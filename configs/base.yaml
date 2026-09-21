@@ -1,0 +1,102 @@
+# =============================================================================
+# radar-agent 基础配置（**引擎无关**）
+#
+# 分层约定（P1 起生效）：
+#   configs/base.yaml             ← 本文件：项目路径、模型"身份"、跨引擎共享的生成默认值
+#   configs/engines/<engine>.yaml ← **某个引擎独有**的运行参数（dtype / ngl / ctx / mmproj ...）
+#   configs/bench/<exp>.yaml      ← 实验矩阵（只引用引擎名，不写引擎参数）
+#
+# 禁止在两个层级重复定义同一个参数 —— 重复 = 迟早不一致 = 静默错误（§4.6）。
+# 变更本文件须同步 docs/，并在 outputs/<run>/config.yaml 留档（§4.3）。
+# =============================================================================
+
+project:
+  name: radar-agent
+  root: "F:/Qwen3-2B/radar-agent"        # 项目根（绝对路径，统一在此声明）
+  seed: 42
+  log_level: INFO
+
+paths:
+  # ---- 基座模型（HF 格式）：不搬移，只引用（§4.1）----
+  model_base_dir: "F:/Qwen3-2B/dir"      # Qwen3-VL-2B-Instruct 权重所在目录
+  # ---- 数据 ----
+  data_raw:        "F:/Qwen3-2B/radar-agent/data_raw"        # 原始 PDF/教材，只读
+  data_processed:  "F:/Qwen3-2B/radar-agent/data_processed"  # 解析/切分产物
+  # ---- P4 检索（新增）----
+  # ⚠️ 用**相对路径**：load_config() 会把它们按 project.root 解析成绝对路径。
+  #    写成绝对路径 = 又把 root 抄一遍 = 「同一参数两处定义」，违反 §4.6。
+  corpus_dir:      "data_processed/corpus"          # MinerU 解析产物（book_pages_v2 / figs / 各 index）
+  chunks_file:     "data_processed/corpus/chunks.jsonl"      # P4-S0 切分产物
+  chunks_manifest: "data_processed/corpus/chunks_manifest.json"
+  index_dir:       "data_processed/index"           # P4-S1 向量/稀疏索引
+  mmwave_dir:      "data_raw/mmWave_Insight"        # 第二套语料（21 篇 md，在 data_raw 下！）
+  # ---- 英文文献（P4-S0b）----
+  # ⚠️ D3 已于 2026-09-20 **修订**：不再"独立语料分开查"，而是与教材**统一入库**到
+  #    `index_dir/unified`（三源：book / mmwave / paper）。
+  #    分开的能力改由索引里的 `sources.json` 提供（检索时按 source_id 过滤），
+  #    这样 P4-S2 既能全库查，也能做「教材-only vs 全库」的 A/B。
+  papers_mineru:   "data_processed/corpus/papers_mineru"       # MinerU 解析产物（每篇一个目录）
+  papers_chunks_file: "data_processed/corpus/papers_chunks.jsonl"
+  papers_manifest: "data_processed/corpus/papers_chunks_manifest.json"
+  eval_file:       "data_processed/sft_v1/eval_frozen.jsonl"  # P3 冻结评测集，供切分做 quote 反查
+  # P4-S2 补的**文献域**检验集：中文提问 → 英文论文（现有 174 条 gold 零条在论文上，这个缺口必须补）
+  paper_eval_file: "data_processed/eval/paper_retrieval_eval.jsonl"
+  web_snapshot:    "data_processed/web_snapshot.jsonl"       # P6 web_search 离线快照
+  # ---- 引擎相关模型资产（GGUF / mmproj / merged）：与 HF 权重物理隔离 ----
+  models_gguf:     "F:/Qwen3-2B/radar-agent/models/gguf"
+  models_merged:   "F:/Qwen3-2B/radar-agent/models/merged"
+  # ---- 产物 ----
+  outputs: "F:/Qwen3-2B/radar-agent/outputs"
+  reports: "F:/Qwen3-2B/radar-agent/reports"
+  logs:    "F:/Qwen3-2B/radar-agent/logs"
+
+# -----------------------------------------------------------------------------
+# 模型"身份"：引擎无关的事实（P0 实测确认）。
+# ⚠️ 这里**不放任何引擎运行参数** —— dtype / device / attn 实现属于具体引擎。
+# -----------------------------------------------------------------------------
+model:
+  name: "Qwen3-VL-2B-Instruct"           # 实测：architectures[0]=Qwen3VLForConditionalGeneration，2,127,532,032 参数
+  architecture: "Qwen3VLForConditionalGeneration"
+  processor_class: "AutoProcessor"
+  # 视觉塔是否参与训练：主链路纯文本 → 全程冻结 + no_grad（§9.2 风险缓解）
+  # 这是**训练策略**而非推理引擎参数，故留在基础配置
+  freeze_vision_tower: true
+  trust_remote_code: false
+
+# -----------------------------------------------------------------------------
+# 跨引擎共享的生成默认值
+# 优先级：benchmark 传入的 gen_cfg  >  引擎 yaml 的覆盖  >  本段默认值
+# 模型卡建议（README「Generation Hyperparameters / Text」）：
+#   top_p=1.0  top_k=40  repetition_penalty=1.0  temperature=1.0
+# ⚠️ 模型卡还给了 presence_penalty，但那是 OpenAI 风格参数，HF/llama.cpp 口径不同，
+#    故不放进共享默认值，避免"以为设了其实没生效"。
+# -----------------------------------------------------------------------------
+generation:
+  # 实测（P0 首轮）：512 对开放式问题不够 —— 模型写满 512 token 仍未结束。
+  # 提到 1024 后自然停止（974 token），暴露 2B 模型结构化长答偏啰嗦。
+  # ⚠️ 用途不同阈值应不同：RAG 问答（要简短带引用）与开放式讲解（可以长）应分别配置。
+  max_new_tokens: 1024
+  do_sample: false           # 基准测试统一贪心，保证可复现（§5.7）
+  temperature: 1.0           # 仅 do_sample=true 时生效
+  top_p: 1.0                 # 仅 do_sample=true 时生效
+  top_k: 40                  # 仅 do_sample=true 时生效
+  repetition_penalty: 1.0
+  seed: 42                   # 显式传 seed，让"3 次重复"真的是同一条件的重复
+  # 实测（P0）：tokenizer eos_token = '<|im_end|>'(151645)，pad_token='<|endoftext|>'(151643)
+  # 不要按版本惯例推断，必须从 tokenizer 读（§4.6 静默错误清单）
+
+# -----------------------------------------------------------------------------
+# P0 环境与模型核验（`scripts/p0_verify.py` 使用）
+# 注意：HF 的运行参数（dtype/device/attn_implementation）已移至 configs/engines/hf.yaml
+# -----------------------------------------------------------------------------
+p0:
+  text_prompts:
+    - "用一句话解释什么是雷达。"
+    - "SAR 和普通雷达的主要区别是什么？"
+  vl:
+    build_synthetic_image: true
+    image_size: [448, 448]     # 小尺寸先保证显存安全
+    prompt: "这张图里有什么？请描述坐标轴标签和曲线形状。"
+  bench:
+    warmup_runs: 1
+    timed_runs: 3              # §5.9：关键结论≥3 次，给出波动范围

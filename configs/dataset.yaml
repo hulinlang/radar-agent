@@ -1,0 +1,282 @@
+# 数据集规范（Dataset Spec）—— 所有阈值、模板、常量在此唯一定义
+# 依据：docs/05 §五（全部对照模型规范实测）
+# 改动本文件 = 改动校验器行为；禁止在代码里另写一份常量。
+#
+# ⚠️ **禁止重复键**：YAML 允许重复键但「后者静默覆盖前者」，属于典型的静默错误。
+#    `src/dataset/schema.py` 的 load_spec 带重复键断言（E_DUP_YAML_KEY），会直接拒绝加载。
+
+spec_version: "0.2"
+
+# ---------------------------------------------------------------------------
+# 模型侧常量（实测来源：logs/probe/p3_chat_template_probe.txt）
+# ---------------------------------------------------------------------------
+model:
+  tokenizer_dir: "F:/Qwen3-2B/dir"
+
+  # 双信源交叉校验：运行时从 tokenizer 读出真实 id 集合，与本列表比对；
+  # 不一致即报 critical —— 防止"模型换了但常量没换"这类静默错误。
+  special_token_ids_expected: [151643, 151644, 151645, 151646, 151647, 151648,
+                               151649, 151650, 151651, 151652, 151653, 151654,
+                               151655, 151656]
+
+  # 非 special、但本项目禁止出现在数据里的保留标记（docs/05 §5.8 决策）
+  banned_token_strings:
+    ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>",
+     "<|vision_end|>", "<|image_pad|>", "<|video_pad|>", "<|vision_pad|>",
+     "<think>", "</think>"]
+
+  image:
+    patch_size: 16
+    merge_size: 2
+    align_multiple: 32          # = patch_size * merge_size；尺寸必须是它的倍数
+    min_pixels: 65536           # 低于此会被上采样（实测 224x224 -> 仍是 64 token）
+    max_pixels: 16777216
+    default_size: [448, 448]    # = 196 视觉 token
+
+  context:
+    max_seq_len: 2048
+    reserve_for_output: 512     # 给答案留的预算
+    max_images_per_sample: 4
+
+# ---------------------------------------------------------------------------
+# 任务类型与答案形态（docs/05 §5.6、§十四）
+#   answer_mode = computed  -> 真值由 src/dataset/formulas.py 程序算出（不可手写）
+#   answer_mode = authored  -> 人写答案，框架只校验格式与注入
+# ---------------------------------------------------------------------------
+tasks:
+  calc:
+    answer_mode: computed
+    required: [formula, inputs, unit]
+  formula:
+    answer_mode: authored
+    required: [answer]
+  choice:
+    answer_mode: authored
+    required: [options, answer]
+  concept:
+    answer_mode: authored
+    required: [answer, keypoints]
+    max_chars: 120
+    # keypoints（要点集）—— 半硬题**可自动判分**的依据。
+    # ⚠️ 硬约束：每个要点必须是 answer 的**子串**，否则判分器会永远判不过（静默失效）。
+    keypoints: {min: 2, max: 6}
+  term:
+    answer_mode: authored
+    required: [answer]
+  unanswerable:
+    answer_mode: authored
+    required: [answer]
+    refusal_must_equal: "资料中未找到相关内容，无法回答。"
+  regime_trap:
+    # 体制陷阱题：选择题变体。选项里放进「把其他体制的结论套过来」的错误答案。
+    answer_mode: authored
+    required: [options, answer]
+  contrast:
+    # 双体制对比/纠错：必须同时给出 regime 与 regime_b 两个**不同**体制，
+    # 逼模型说清"同一个词在两个体制下差在哪"。
+    answer_mode: authored
+    required: [answer, regime_b, keypoints]
+    max_chars: 200
+    keypoints: {min: 3, max: 6}   # 对比题要求分别答到两个体制 → 要点数下限更高
+  clarify:
+    # 体制信息不足时，正确行为是**先澄清**而不是猜测。
+    # ⚠️ 配比必须小（框架有 W_CLARIFY_SHARE 配额警告）——
+    #    否则模型会"过度澄清"，对本来明确的问题也反问（SFT 的典型副作用）。
+    answer_mode: authored
+    required: [answer]
+    must_ask: true
+    clarify_must_contain: ["体制"]
+
+  # ---------------------------------------------------------------------------
+  # 视觉题（modality=vision）—— 2026-09-15 补登记，落实已拍板的 D-P2-3「做 SFT-V」
+  #   背景：docs/05 §5.2 早已定义这 4 类，但 spec 里一直**没有登记** →
+  #         `task: figure_qa` 会被判 E_TASK（critical），SFT-V 样本根本无法编译。
+  #         spec 落后于已拍板的决策，这里补齐。（属**扩展**，不改动任何既有题的规则）
+  #
+  #   ⚠️ 真值来源分两路（docs/06 §六）：
+  #     · L1 合成图 → figure_truth 与图**同源生成**，判分可用 numeric；
+  #     · **教材图**（本轮）→ 真值由**人工核对**（L3），**无可靠数值真值**，
+  #       故判分一律走 keypoints 要点覆盖（不混用 numeric）。
+  #   ⚠️ 因此本组任务的 answer 必须是**可被要点覆盖的短答**，不要写成数值。
+  # ---------------------------------------------------------------------------
+  figure_qa:
+    # 看懂图在讲什么：图属于哪一类、表达了什么结构/现象
+    answer_mode: authored
+    vision_only: true
+    required: [answer, keypoints]
+    max_chars: 120
+    keypoints: {min: 2, max: 6}
+  readout:
+    # 读图：读出图中**明确标注**的量（坐标/图例/标注文字），不要求读未标注的精确数值
+    answer_mode: authored
+    vision_only: true
+    required: [answer, keypoints]
+    max_chars: 120
+    keypoints: {min: 1, max: 6}
+  trend:
+    # 读趋势：随自变量变化，曲线的走向/极值/对称性
+    answer_mode: authored
+    vision_only: true
+    required: [answer, keypoints]
+    max_chars: 120
+    keypoints: {min: 2, max: 6}
+  compare:
+    # 图内对比：多条曲线/多个子图之间的差异
+    answer_mode: authored
+    vision_only: true
+    required: [answer, keypoints]
+    max_chars: 200
+    keypoints: {min: 2, max: 6}
+
+# ---------------------------------------------------------------------------
+# 答案模板（占位符用 <<name>>，避免与 LaTeX 的花括号冲突）
+# ---------------------------------------------------------------------------
+answer_templates:
+  calc: "公式：<<formula_latex>>\n代入：<<substitution_latex>>\n最终答案：<<value>> <<unit>>"
+  formula: "公式：<<answer>>\n最终答案：<<answer>>"
+  # ⚠️ 选择题答案曾经只给一个字母（"最终答案：A"）。两个后果（2026-09-18 实测）：
+  #   ① 与"题面没有选项"叠加后，模型只能学"题面→字母"的噪声映射；
+  #   ② 模型把"短输出 = 字母"泛化到开放题（微调后 20 条非选择题输出纯字母，基座 0 条）。
+  # 现改为「选 X，因为…」+ 末尾保留字母锚点：既给解释，也留判分锚。
+  choice: "选 <<answer>>，因为 <<explanation>>\n最终答案：<<answer>>"
+  concept: "<<answer>>"
+  term: "最终答案：<<answer>>"
+  unanswerable: "<<answer>>"
+  regime_trap: "选 <<answer>>，因为 <<explanation>>\n最终答案：<<answer>>"
+  contrast: "<<answer>>"
+  clarify: "<<answer>>"
+  figure_qa: "<<answer>>"
+  readout: "<<answer>>"
+  trend: "<<answer>>"
+  compare: "<<answer>>"
+
+# ---------------------------------------------------------------------------
+# 问法（ask_style）—— 保证同一知识点被**多种问法**覆盖，打破"关键词捷径"
+#   捷径示例：模型学会"看到毫米波就答 FMCW、看到星载就答 SAR"。
+#   靠同一体制换不同问法、以及 regime=unspecified 的澄清样本，把这个捷径打断。
+# ---------------------------------------------------------------------------
+ask_styles:
+  explicit:
+    label: 显式给体制
+  implicit:
+    label: 隐含在参数里（如给 Ka 波段 FMCW）
+  contrast:
+    label: 双体制对比
+  correct:
+    label: 纠错式（指出别人用错体制的地方）
+  parametric:
+    label: 参数化推导
+  clarify:
+    label: 信息不足，应澄清
+
+# ---------------------------------------------------------------------------
+# 默认值
+# ---------------------------------------------------------------------------
+defaults:
+  # 统一系统提示：约束输出长度与格式（P0 实测 2B 模型开放式长答极啰嗦，
+  # 一问写 974 token）。系统提示只是"第一道约束"，真正的格式靠训练教会。
+  system: >-
+    你是雷达信号处理领域的助手。回答务必简洁，不超过 3 行正文；
+    公式一律用 LaTeX（行内 $...$，块级 $$...$$）；
+    最后一行必须以「最终答案：」开头给出结论。
+  ask_style: explicit
+
+# ---------------------------------------------------------------------------
+# 分类（用于 R7 子方向配额与分层统计）
+# ---------------------------------------------------------------------------
+# ⚠️ 2026-09-18 补落地：D-P2-20 拍板的「subdomain 6 → 11」当时**只写进了
+#    logs/probe/_draft_spec_v1.yaml（临时目录），configs 里的默认 spec 一直是 6 项**，
+#    结果既有 1000 条里 detection/clutter/array_processing/tracking/imaging 共 444 条
+#    用的是一份不在版本化配置里的 spec。本次**纯增量**补进这 5 项，使默认 spec 与数据集一致。
+#    只加 subdomain，不搬 draft 的 tasks / answer_templates —— 后者会把 choice、regime_trap
+#    的渲染改成「解析：…\n最终答案：…」，会让既有已编译产物对不上。
+subdomains: [pulse_compression, ambiguity, resolution, radar_equation, doppler,
+             array_processing, clutter, detection, tracking, imaging, misc]
+difficulties: [easy, medium, hard]
+
+# ---------------------------------------------------------------------------
+# 雷达体制（regime）与平台（platform）—— 两根**正交**的轴
+#   subdomain = 问什么知识；regime = 什么体制；platform = 什么平台。
+#
+#   ⚠️ 为什么必须拆成两轴：单靠 regime 表达不了
+#     · 同平台不同体制：机载既可能是「脉冲多普勒」，也可能是「SAR」；
+#     · 同体制不同平台：FMCW 可用于车载、机载高度表、星载测高计。
+#   这两类歧义正是模型最容易走关键词捷径的地方（外部建议 §四）。
+#
+#   ⚠️ 为什么 regime 必须显式：同一名词在不同体制下口径不同。"距离分辨率"在
+#      脉冲雷达里 B 是信号带宽，在 FMCW 里 B 是**扫频带宽**，在 SAR 方位向
+#      则完全与带宽无关（ΔR_az = D/2）。不声明体制 → 题目没有唯一答案。
+#
+#   surface_terms = 该体制的「表面词」；regime != universal/unspecified 时，
+#   题面**必须**出现其中至少一个词（E_REGIME_SURFACE，可机器判定）。
+# ---------------------------------------------------------------------------
+regimes:
+  universal:
+    label: 体制无关（普适原理）
+    surface_terms: []
+    platforms: ["unspecified", "ground", "airborne", "spaceborne", "vehicle", "ship"]
+  unspecified:
+    # 专用于「体制信息不足」的样本：题面**故意不给体制**，正确行为是**先澄清**。
+    # 双向断言：regime=unspecified ⟺ task=clarify（两者必须同时成立）。
+    # 这不是"通用"，而是"未确定" —— 二者必须区分，否则就等于鼓励猜测。
+    label: 未指定（应澄清，不得猜测）
+    surface_terms: []
+    platforms: ["unspecified"]
+  ground_pulse:
+    label: 地基脉冲雷达
+    surface_terms: ["地基", "地面雷达", "地基雷达", "地面站"]
+    platforms: ["ground"]
+  airborne_pulse:
+    label: 机载脉冲多普勒 / 火控
+    surface_terms: ["机载", "载机", "空中平台", "机载雷达", "脉冲多普勒"]
+    platforms: ["airborne"]
+  spaceborne:
+    label: 星载雷达
+    surface_terms: ["星载", "卫星", "天基", "在轨"]
+    platforms: ["spaceborne"]
+  automotive_mmwave:
+    label: 车载毫米波雷达
+    surface_terms: ["毫米波", "车载", "24 GHz", "77 GHz", "79 GHz", "毫米波雷达"]
+    platforms: ["vehicle"]
+  fmcw:
+    label: FMCW 调频连续波雷达
+    surface_terms: ["FMCW", "调频连续波", "连续波", "扫频"]
+    # 允许多个平台：FMCW 不只是车载。这正是为了防止"FMCW → 车载"的捷径。
+    platforms: ["vehicle", "airborne", "spaceborne", "ground"]
+  mimo:
+    label: MIMO 雷达（架构维度）
+    surface_terms: ["MIMO", "多输入多输出", "虚拟阵列", "波形分集"]
+    platforms: ["ground", "airborne", "spaceborne", "vehicle", "ship"]
+  sar:
+    label: 合成孔径雷达
+    surface_terms: ["SAR", "合成孔径", "ISAR", "逆合成孔径"]
+    platforms: ["airborne", "spaceborne"]
+  phased_array:
+    label: 相控阵雷达（架构维度）
+    surface_terms: ["相控阵", "有源相控阵", "AESA", "阵面"]
+    platforms: ["ground", "airborne", "ship", "spaceborne", "vehicle"]
+
+platforms: [unspecified, ground, airborne, spaceborne, vehicle, ship]
+
+# ---------------------------------------------------------------------------
+# id 前缀（物理隔离用；加载器靠它断言"训练集里不可能读到评测集"）
+# ---------------------------------------------------------------------------
+id_prefix:
+  "train.text": "txt"
+  "train.vision": "vis"
+  "eval.text": "evt"
+  "eval.vision": "evv"
+
+# ---------------------------------------------------------------------------
+# 数值判分容差默认值（容差必须有依据，不可随手写）
+# ---------------------------------------------------------------------------
+tolerance:
+  default_rel: 0.01            # 常数近似（如 c=3e8）
+  by_task:
+    calc: 0.01
+
+# ---------------------------------------------------------------------------
+# 配比上限（超出即 warning；目的是防"捷径"与"过度澄清"两种偏向）
+# ---------------------------------------------------------------------------
+shares:
+  clarify_max: 0.10            # clarify 类占比上限，过高会导致模型"过度澄清"

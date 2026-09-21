@@ -1,0 +1,39 @@
+# P4-S1 · 被排除的 Front Matter（论文元数据区）
+
+- 共 **34** 条，来自 34 篇
+- 这些内容**不参与检索**（作者/单位/邮箱/Index Terms/DOI），但 chunks 产物里仍保留
+
+- `paper_031_text_001` ｜ 131 字 ｜ Karol Gregor and Yann LeCun {kgregor,yann}@cs.nyu.edu Courant Institute, New Yor
+- `paper_004_text_001` ｜ 225 字 ｜ Gongguo Tang†, Badri Narayan Bhaskar†, Parikshit Shah], and Benjamin Recht] †Dep
+- `paper_006_text_001` ｜ 158 字 ｜ John R. HersheyMERLCambridge, MA, USAhershey@merl.com Jonathan Le Roux MERL Camb
+- `paper_023_text_001` ｜ 1693 字 ｜ YANG ZHAOCHENG , Member, IEEE Shenzhen University, Shenzhen, China RODRIGO C. DE
+- `paper_010_text_002` ｜ 233 字 ｜ A. Aubry, Senior Member, IEEE, A. De Maio Fellow, IEEE, and L. Pallotta, Member,
+- `paper_003_text_002` ｜ 216 字 ｜ Vishal Monga, Senior Member, IEEE, Yuelong Li, Member, IEEE, and Yonina C. Eldar
+- `paper_028_text_002` ｜ 495 字 ｜ 朱晗归      冯为可*      冯存前      邹  帛      路复宇 (空军工程大学防空反导学院   西安   710051) 关键词：空时自适应
+- `paper_007_text_002` ｜ 505 字 ｜ Article Kun Liu 1, Tong Wang 1,*, Jianxin Wu 2 and Jinming Chen 1 1 National Lab
+- `paper_033_text_001` ｜ 1223 字 ｜ Correspondence Space–Time Adaptive Processing Using Deep Neural Network-Based Sh
+- `paper_015_text_002` ｜ 164 字 ｜ Yusuke Ono, Member, IEEE, and Linyu Peng, Member, IEEE Index Terms—Bures–Wassers
+- `paper_022_text_002` ｜ 294 字 ｜ FULL LENGTH ARTICLE [图] Quanyang BI, Dan LI *, Jianqiu ZHANG Department of Elect
+- `paper_034_text_002` ｜ 188 字 ｜ Zhaolong Wang , Xiaokuan Zhang , Weike Feng , Xixi Chen , and Ninghui Li Index T
+- `paper_008_text_001` ｜ 292 字 ｜ [图] Runze Hu , Tong Wang ,∗, Weijun Huang, Weichen Cui National Key Laboratory o
+- `paper_032_text_002` ｜ 1705 字 ｜ MAHER MOAKHER† Key words. geometric mean, positive-definite symmetric matrices, 
+- `paper_026_text_001` ｜ 1003 字 ｜ BOAZ PORAT, Fellow, IEEE Technion Israel BENJAMIN FRIEDLANDER, Fellow, IEEE Univ
+- `paper_014_text_002` ｜ 574 字 ｜ Received October 28, 2020, accepted November 9, 2020, date of publication Novemb
+- `paper_017_text_001` ｜ 324 字 ｜ [图] Weike Fenga, Yiduo Guoa,b,∗, Yongshun Zhangb, Jian Gonga,b a National Labora
+- `paper_018_text_002` ｜ 37 字 ｜ YOSEF ROCKAH AND PETER M. SCHULTHEISS
+- `paper_035_text_002` ｜ 278 字 ｜ Xiaolin $\mathrm { D u } ^ { \mathbb { P } }$, Member, IEEE, Yang Jing, Xiaolong
+- `paper_036_text_001` ｜ 1236 字 ｜ BLAIR D. CARLSON, Member, IEEE Lincołn LaboratoryM.I.T. The use of adaptive beam
+- `paper_020_text_002` ｜ 43 字 ｜ Anthony J. Weiss1 and Benjamin Friedlander1
+- `paper_005_text_002` ｜ 241 字 ｜ Zhexian Liu, Shuai Shao , Hongwei Liu , Senior Member, IEEE, and Tao Su , Member
+- `paper_012_text_001` ｜ 3890 字 ｜ Vincent Arsigny,* Pierre Fillard, Xavier Pennec, and Nicholas Ayache Diffusion t
+- `paper_030_text_001` ｜ 213 字 ｜ [图] a Yantai University, Yantai 264005, China b Naval Aviation University, Yanta
+- `paper_024_text_001` ｜ 1130 字 ｜ Correspondence Space-time adaptive processing gets its adaptivity from estimatin
+- `paper_025_text_001` ｜ 1981 字 ｜ HONG WANG, Senior Member, IEEE Syracuse University LUJING CAI, Member, IEEE AT&T
+- `paper_021_text_002` ｜ 266 字 ｜ Jian Li, Senior Member, IEEE, Petre Stoica, Fellow, IEEE, and Zhisong Wang, Stud
+- `paper_029_text_001` ｜ 134 字 ｜ I.S. REED, Fellow, IEEE J.D. MALLETT, Member, IEEE L.E. BRENNAN, Member IEEE Tec
+- `paper_019_text_002` ｜ 263 字 ｜ Sergiy A. Vorobyov, Member, IEEE, Alex B. Gershman, Senior Member, IEEE, and Zhi
+- `paper_011_text_001` ｜ 260 字 ｜ [图] Weichen Cui , Tong Wang *, Degen Wang , Weijun Huang National Key Laboratory
+- `paper_016_text_001` ｜ 423 字 ｜ [图] Pengcheng Bai a, Yi Gan b, Yunxiu Yang c, Qin Shu a, , a College of Electric
+- `paper_037_text_001` ｜ 104 字 ｜ James Ward Lincoln Laboratory Massachusetts Institute of Technology Lexington, M
+- `paper_027_text_002` ｜ 340 字 ｜ PANG Xiaojiao, ZHAO Yongbo*, CAO Chenghu, XU Baoqing, and HU Yili National Lab o
+- `paper_013_text_001` ｜ 93 字 ｜ L.E. BRENNAN, Member IEEE I.S. REED Technology Service Corporation Santa Monica,

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>radar-agent · 雷达问答 Agent 演示</title>
+<style>
+  :root{
+    --bg:#f7f7f5; --panel:#ffffff; --line:#e3e1dc; --ink:#2c2c2a;
+    --ink2:#5f5e5a; --ink3:#888780; --accent:#185fa5; --accent-bg:#e6f1fb;
+    --ok:#3b6d11; --ok-bg:#eaf3de; --warn:#854f0b; --warn-bg:#faeeda;
+    --bad:#a32d2d; --bad-bg:#fcebeb; --mono:ui-monospace,Consolas,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:18px 20px 60px}
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+         padding-bottom:12px;border-bottom:1px solid var(--line)}
+  h1{font-size:17px;font-weight:500;margin:0}
+  .sub{font-size:12px;color:var(--ink3)}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+  .chip{font-size:12px;padding:4px 10px;border-radius:999px;background:var(--panel);
+        border:1px solid var(--line);color:var(--ink2)}
+  .chip b{font-weight:500;color:var(--ink)}
+  .chip.on{background:var(--accent-bg);border-color:#b5d4f4;color:var(--accent)}
+  .row{display:flex;gap:14px;align-items:stretch;flex-wrap:wrap}
+  .in{flex:1;min-width:280px;display:flex;gap:8px}
+  input[type=text]{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:8px;
+                   background:var(--panel);font-size:14px;color:var(--ink)}
+  input[type=text]:focus{outline:2px solid #b5d4f4;border-color:var(--accent)}
+  button{padding:10px 16px;border-radius:8px;border:1px solid var(--accent);
+         background:var(--accent);color:#fff;font-size:14px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  button.ghost{background:var(--panel);color:var(--ink2);border-color:var(--line)}
+  button.ghost:hover{border-color:var(--accent);color:var(--accent)}
+  .samples{margin:14px 0 4px}
+  .samples a{display:inline-block;margin:0 8px 8px 0;font-size:12px;color:var(--accent);
+             text-decoration:none;border:1px dashed #b5d4f4;border-radius:8px;
+             padding:6px 10px;background:var(--panel);cursor:pointer}
+  .samples a:hover{background:var(--accent-bg)}
+  .samples .why{color:var(--ink3);font-size:11px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:14px 16px;margin-top:14px}
+  .card h2{font-size:13px;font-weight:500;margin:0 0 10px;color:var(--ink2)}
+  .ans{white-space:pre-wrap;font-size:14px;line-height:1.75}
+  .step{border-left:3px solid var(--line);padding:8px 0 8px 12px;margin-bottom:10px}
+  .step.ok{border-left-color:var(--ok)}
+  .step.none{border-left-color:var(--ink3)}
+  .step.malformed{border-left-color:var(--bad)}
+  .step.mention_only{border-left-color:var(--warn)}
+  .step .hd{font-size:12px;color:var(--ink3);display:flex;gap:10px;flex-wrap:wrap}
+  .step .hd .tag{font-weight:500}
+  .call{font-family:var(--mono);font-size:12px;background:#f1efe8;border-radius:6px;
+        padding:7px 9px;margin:6px 0;white-space:pre-wrap;word-break:break-all}
+  .obs{font-size:12.5px;color:var(--ink2);background:#faf9f6;border:1px solid var(--line);
+       border-radius:6px;padding:7px 9px;margin:6px 0;white-space:pre-wrap;
+       max-height:170px;overflow:auto}
+  .cite{border:1px solid var(--line);border-radius:8px;margin-top:8px;overflow:hidden}
+  .cite .hd{padding:8px 10px;background:#faf9f6;font-size:12px;display:flex;
+            justify-content:space-between;gap:10px;cursor:pointer;align-items:center}
+  .cite .id{font-family:var(--mono);font-size:11.5px;color:var(--accent)}
+  .cite .body{display:none;padding:10px;border-top:1px solid var(--line);
+              font-size:12.5px;color:var(--ink2);white-space:pre-wrap;
+              max-height:280px;overflow:auto}
+  .cite.open .body{display:block}
+  .ok-badge{background:var(--ok-bg);color:var(--ok)}
+  .bad-badge{background:var(--bad-bg);color:var(--bad)}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .meta span{font-size:11.5px;color:var(--ink3);background:#f1efe8;
+             border-radius:6px;padding:3px 8px}
+  .empty{color:var(--ink3);font-size:13px;padding:18px 0;text-align:center}
+  .spinner{display:inline-block;width:12px;height:12px;border:2px solid #b5d4f4;
+           border-top-color:var(--accent);border-radius:50%;
+           animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .hint{font-size:12px;color:var(--ink3);margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>radar-agent · 雷达问答 Agent</h1>
+    <span class="sub">Qwen3-VL-2B + 检索 + 工具调用（ReAct）</span>
+  </header>
+
+  <div class="bar" id="bar"><span class="chip">正在加载模型…</span></div>
+
+  <div class="row">
+    <div class="in">
+      <input type="text" id="q" placeholder="问一个雷达问题，例如：带宽 100MHz 的距离分辨率是多少？">
+      <button id="go">发送</button>
+    </div>
+    <button class="ghost" id="mode">模式：完整系统</button>
+  </div>
+
+  <div class="samples" id="samples"></div>
+
+  <div id="out"><div class="empty">问一个问题，这里会显示答案、每一步的工具调用过程，以及引用到的原文。</div></div>
+
+  <div class="hint">
+    「完整系统」= 模型自己决定要不要查资料、要不要用计算器；
+    「无工具对照」= 什么都不给，凭模型自己答。两者并排看，能直观看出检索带来了什么。
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let MODE = 'rag';
+
+async function health(){
+  try{
+    const r = await fetch('/api/health').then(x=>x.json());
+    document.getElementById('bar').innerHTML =
+      `<span class="chip on">${r.ready?'就绪':'加载中'}</span>` +
+      `<span class="chip">适配器 <b>${r.adapter||'基座'}</b></span>` +
+      `<span class="chip">语料 <b>${r.n_chunks}</b> 条</span>` +
+      `<span class="chip">工具 <b>${(r.tools||[]).join(' / ')}</b></span>`;
+  }catch(e){
+    document.getElementById('bar').innerHTML = `<span class="chip">后端未就绪</span>`;
+  }
+}
+
+async function samples(){
+  const list = await fetch('/api/samples').then(x=>x.json());
+  document.getElementById('samples').innerHTML =
+    '<span class="why">试试这些：</span>' + list.map(s=>
+      `<a data-q="${encodeURIComponent(s.q)}">${s.q.slice(0,26)}… <span class="why">${s.why}</span></a>`
+    ).join('');
+  document.querySelectorAll('#samples a').forEach(a=>{
+    a.onclick = ()=>{ $('#q').value = decodeURIComponent(a.dataset.q); ask(); };
+  });
+}
+
+function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function renderSteps(steps){
+  if(!steps || !steps.length) return '';
+  return steps.map(s=>{
+    const calls = (s.calls||[]).map(c=>
+      `<div class="call">${esc(c.name)}(${esc(JSON.stringify(c.args))})</div>`).join('');
+    const obs = (s.observations||[]).map(o=>`<div class="obs">${esc(o)}</div>`).join('');
+    return `<div class="step ${s.status}">
+      <div class="hd">
+        <span class="tag">第 ${s.step+1} 步</span>
+        <span>${s.status}</span>
+        <span>生成 ${s.t_gen_ms}ms</span>
+        <span>工具 ${s.t_exec_ms}ms</span>
+        ${s.forced?'<span>[强制收尾]</span>':''}
+      </div>${calls}${obs}</div>`;
+  }).join('');
+}
+
+function renderCites(cs){
+  if(!cs || !cs.length) return '';
+  return `<div class="card"><h2>引用到的原文（${cs.length} 段）</h2>` + cs.map((c,i)=>
+    `<div class="cite" data-i="${i}">
+       <div class="hd">
+         <span><span class="id">${esc(c.chunk_id)}</span>
+           ${c.found?'':' <span class="bad-badge">语料中不存在</span>'}</span>
+         <span>${esc(c.title_path||'')} <span class="why">点击展开</span></span>
+       </div>
+       <div class="body">${esc(c.text||'(无正文)')}</div>
+     </div>`).join('') + `</div>`;
+}
+
+async function ask(){
+  const q = $('#q').value.trim();
+  if(!q) return;
+  $('#go').disabled = true;
+  $('#out').innerHTML = `<div class="card"><div class="ans"><span class="spinner"></span>
+    正在运行${MODE==='rag'?'（模型可能查资料、调计算器，约 20 秒）':'（纯生成，约 5 秒）'}…</div></div>`;
+  try{
+    const r = await fetch('/api/ask',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:q, mode:MODE})}).then(x=>x.json());
+    const meta = `<div class="meta">
+      <span>耗时 ${(r.wall_ms/1000).toFixed(1)}s</span>
+      <span>工具 ${r.tool_ms}ms</span>
+      <span>${r.tokens} tokens</span>
+      ${Object.entries(r.counters||{}).filter(([,v])=>v).map(([k,v])=>`<span>${k} ${v}</span>`).join('')}
+    </div>`;
+    $('#out').innerHTML =
+      `<div class="card"><h2>最终答案 · ${r.mode==='rag'?'完整系统':'无工具对照'}</h2>
+         <div class="ans">${esc(r.answer||'(空)')}</div>${meta}</div>` +
+      (r.steps && r.steps.length
+        ? `<div class="card"><h2>过程（${r.steps.length} 步）</h2>${renderSteps(r.steps)}</div>`
+        : '') +
+      renderCites(r.citations);
+    document.querySelectorAll('.cite .hd').forEach(h=>{
+      h.onclick = ()=> h.parentElement.classList.toggle('open');
+    });
+  }catch(e){
+    $('#out').innerHTML = `<div class="card"><div class="ans">请求失败：${esc(String(e))}</div></div>`;
+  }
+  $('#go').disabled = false;
+}
+
+$('#go').onclick = ask;
+$('#q').addEventListener('keydown', e=>{ if(e.key==='Enter') ask(); });
+$('#mode').onclick = ()=>{
+  MODE = MODE==='rag' ? 'plain' : 'rag';
+  $('#mode').textContent = '模式：' + (MODE==='rag'?'完整系统':'无工具对照');
+};
+health(); samples();
+setInterval(health, 15000);
+</script>
+</body>
+</html>

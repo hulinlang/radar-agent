@@ -1,0 +1,140 @@
+# =============================================================================
+# P4 检索阶段参数（**非路径**参数）
+#
+# 分层约定（同 configs/base.yaml 头部，此处不重复）：
+#   configs/base.yaml      ← 路径（paths.*）、模型身份、跨阶段共享项
+#   configs/retrieval.yaml ← 本文件：切分与检索的**算法参数**
+# ⚠️ 禁止跨层重复定义同一个参数（违反 = 迟早不一致 = 静默错误，§4.6）
+#
+# 变更本文件须同步 docs/10_P4基线RAG.md，并在 chunks_manifest.json 里留 config 签名。
+# =============================================================================
+
+chunk:
+  # 贪心打包的目标长度（字符数）。实测模拟：800 → 572 chunk / p50 771 / p90 1101
+  target: 800
+  # 硬上限：即使处于「公式段」也不再追加（原子块本身不可拆，故单块可超此值）
+  hard_cap: 3000
+  # 结算后短于此长度的 chunk 尝试并入同节的前一个 chunk
+  merge_tiny: 120
+  # 图 chunk 组装时，向前后各取多少字符的周围正文作为上下文
+  figure_context_chars: 150
+  # 公式 chunk 组装时，向前取多少字符的 surrounding
+  equation_context_chars: 200
+
+boundary:
+  # 硬边界：绝不跨越层级 <= max_level 的标题（1=章 2=节 3=小节）
+  max_level: 3
+
+skip:
+  # 噪音块，与 scripts/p2_corpus_sections.py:40 的 SKIP_TYPES 保持一致
+  types: ["page_header", "page_number", "page_footer", "index"]
+  # paragraph 但 paragraph_content 为空的 MinerU 空壳块（实测 77 个）
+  drop_empty_paragraph: true
+  # 用户 2026-09-19 拍板：list 块（思考题/参考文献/小结要点）本步**不入库**
+  keep_list_blocks: false
+
+formula:
+  # 修 `\tag{<sup>(</sup>7.2.9<sup>)</sup>}` → `\tag{7.2.9}`（实测 23 条，p255-259）
+  fix_tag_sup: true
+
+figure:
+  # 图注清洗后短于此阈值，或仅为面板号（`(a)` / `(b)`）→ 判为无效图注，不入库
+  caption_min_chars: 4
+  panel_noise_pattern: "^\\(?[a-zA-Z]\\)?[\\.、,，]?$"
+
+mmwave:
+  # 元文档：非雷达知识，会污染「FMCW」「多普勒」等查询的召回
+  # ⚠️ 路径相对 repo 根：`changelog.md` / `contributing.md` 在 docs/ 下，不带前缀匹配不到
+  exclude:
+    - "AGENTS.md"
+    - "docs/changelog.md"
+    - "docs/contributing.md"
+    - "docs/index.md"
+    - "docs/images/README.md"
+  # 主切分粒度：2 = 按 `##` 切；h2 块超过 drill_down_chars 才下钻到 `###`
+  primary_level: 2
+  drill_down_chars: 1200
+
+# =============================================================================
+# 索引与检索（P4-S1，src/retrieval/index.py）
+#
+# ⚠️ **统一库**：教材 chunks.jsonl + 英文论文 papers_chunks.jsonl 进**同一个**索引
+#    （含 mmWave，因为教材侧 chunks 里已有 200 条 source_type=mmwave）。
+#    用户 2026-09-20 拍板；此前 D3 的"分开建库"已废弃。
+# =============================================================================
+index:
+  # dense 编码批大小。8 GiB 卡上 bge-m3 峰值实测 **2.13 GiB**，16 是稳妥值
+  batch_size: 16
+  # bge-m3 官方上限 8192，但长文本显存与耗时陡增；
+  # 实测 chunk p90=3222 字符 → 512 token 会截断一部分，**1024 覆盖更全且显存仍够**
+  max_len: 1024
+  # RRF 常数（Cormack 2009 量级；越大则"排名靠前"的优势越平滑）
+  rrf_k: 60
+  # 融合时**两路各取前 top_n 条**。⚠️ 两侧必须相同：
+  #   不同则某一路的"未进榜"被隐式当成无穷大排名 = 给另一路偷偷加权，正是要避免的
+  top_n: 20
+  # 最终返回条数
+  top_k: 5
+
+  # ---- Front Matter 去噪（src/retrieval/filters.py）----
+  # 论文的「作者/单位/邮箱/Index Terms/DOI」区不参与检索。
+  # 实测污染：35 篇里 34 篇有，共 58 条；查「原子范数最小化」曾排到第 2 名。
+  # 产物本身**不删**（chunks.jsonl 保留），只在索引侧排除 → 关掉此开关即可恢复。
+  exclude_front_matter: true
+
+  # ---- 公式概念索引（第四路召回）----
+  # ⚠️ **默认关闭**：2026-09-20 实测为**净负收益**，不要因为"听起来对"就打开。
+  #    开着时整体：R@1 47.7%→46.6%、R@5 75.3%→73.6%、MRR 0.590→0.573。
+  #    （不加"计算意图"门槛时更糟：R@1 掉到 35.6%、MRR 掉到 0.480。）
+  #    负收益原因：概念表的术语太宽（"多普勒频率"能挂到 36 个公式块），
+  #    而 pin 是**强制置顶**，会把真正的答案挤下去。
+  #    想再启用，先解决这两点之一：① 概念表配结构指纹（方案 B）做得更准
+  #                              ② 把 pin 改成"加分"而不是"置顶"
+  use_concepts: false
+  concept_pin_n: 3
+
+  # ---- 图号/表号精确索引（第三路召回）----
+  # BM25 是词袋模型，分不清 `Fig. 1` 和 `first`（实测把这个搞反过一次）。
+  # 命中后直接 pin 到结果头部，同一图号跨 35 篇会命中多次 → 按 BM25 分排序取前 ref_pin_n 条。
+  use_refs: true
+  ref_pin_n: 3
+
+  # ---- 默认检索范围（供 P4-S2 做 A/B）----
+  # null = 全库；["book"] / ["paper"] / ["paper_031"] 按 source_id 前缀过滤
+  sources: null
+
+# =============================================================================
+# 检索评测（P4-S2，src/retrieval/evaluate.py）
+# =============================================================================
+eval:
+  # 融合时两路各取前 top_n；这里比 index.top_n 大，给 source 过滤留余量
+  top_n: 20
+  # 最大评估位次（Recall@1/3/5/10 都从这里算）
+  max_k: 10
+  ref_pin_n: 3
+  # gold 数量上限。超过说明 quote **没判别力**（短 quote 到处命中）→ 剔除，不进主评测。
+  # ⚠️ 实测（2026-09-20）：≤10 字的 quote 平均额外命中 **5.94** 个；
+  #    `距离分辨率`(5字) → 124 个 gold，Recall@1 等于白送。取 5 时保留 145 条。
+  max_gold: 5
+  # 「教材语料」= 除英文文献外的全部来源。
+  # ⚠️ 不能只写 ["book"]：P3 冻结评测集有 **24 条 gold 在 mmwave**，
+  #    只留 book 会让该组 Recall 天然低 13 个百分点 —— 那是假信号。
+  textbook_sources: ["book", "mmwave"]
+
+  # ---- 伪标注规模：eval 200 条 → 181 条有 quote 且回捞成功 ----
+# =============================================================================
+# 英文论文切分（P4-S0b，src/retrieval/paper_chunk.py）
+#
+# 与教材 `chunk:` 段**刻意不同**：论文按 **section** 切（D4 决策），
+# 一个 section 通常整段保留以维持论证完整性，只有超长才二次按行切。
+# =============================================================================
+papers:
+  # 单个 section 超过 hard_cap 时，按行再切的目标长度
+  target: 1500
+  # 超过此长度才二次切分。论文一个 section 平均 1000~3000 字符，
+  # 定 6000 意味着**绝大多数 section 整段保留**（上下文完整 >> 长度均匀）
+  hard_cap: 6000
+  # 小于此长度的相邻同类 chunk 合并（避免只有一句话的孤儿 chunk）
+  merge_tiny: 120
+  # 图注短于此值不单独成 figure chunk（`(a)` 这类子图面板号）
+  caption_min_chars: 4

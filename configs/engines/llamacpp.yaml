@@ -1,0 +1,74 @@
+# =============================================================================
+# 引擎配置：llamacpp（llama.cpp / llama-server）
+# 只放**本引擎独有**的运行参数。路径与生成默认值见 configs/base.yaml。
+# 定位：推理 / 部署主选引擎
+#
+# 安装（本机已装，winget 包 ggml.llamacpp b10951）：
+#   winget install --id ggml.llamacpp -e
+# 实测：该包分发的是 **Vulkan 后端**（含 ggml-vulkan.dll），不是 CUDA 后端。
+# =============================================================================
+
+engine:
+  name: llamacpp
+  display: "llama.cpp (llama-server)"
+
+binary:
+  # winget 会把包解到 LOCALAPPDATA 下的包目录，且**当前会话的 PATH 是陈旧的**，
+  # 所以这里用绝对路径 + glob（容忍构建号变化）。%VAR% 由 os.path.expandvars 展开。
+  bin_dir: "%LOCALAPPDATA%/Microsoft/WinGet/Packages/ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe"
+
+model:
+  # GGUF 资产与 HF 权重物理隔离，统一放在 models/gguf/（见 .gitignore）
+  llm_path:    "${paths.models_gguf}/Qwen3VL-2B-Instruct-Q4_K_M.gguf"
+  mmproj_path: "${paths.models_gguf}/mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  startup_timeout_s: 300
+
+  # ---------------------------------------------------------------------------
+  # ⚠️ 最容易踩的静默错误：设备选择
+  # 实测 `llama-cli --list-devices` 在本机返回两个设备：
+  #     Vulkan0: NVIDIA GeForce RTX 4060 Laptop GPU  (7956 MiB, 7188 free)
+  #     Vulkan1: AMD Radeon(TM) Graphics             (32602 MiB 共享内存 = 核显)
+  # 若不指定 --device，负载可能落到**核显**上：不报错、只是慢很多。
+  # 适配器会在 start() 时用 --list-devices 反查该索引背后的物理设备名，
+  # 若不含 "NVIDIA" 直接报错（fail fast），而不是静静地产出一组错误的性能数据。
+  # ---------------------------------------------------------------------------
+  device: "Vulkan0"
+
+  n_gpu_layers: 99        # -ngl：99 = 尽量全部层放 GPU
+  ctx_size: 8192          # -c：RAG 场景需要 4–8K
+  parallel: 1             # -np：基准测试固定 1 槽，保证测量干净
+  flash_attn: true        # -fa on
+  threads: null           # null = 由 llama.cpp 自行决定（CPU 侧）
+  seed: 42
+
+  # KV Cache 量化（省显存换并发）。默认关闭：先取"未量化"的干净基线，
+  # 再单独跑一组开启的做对比（§5.9 只改一个变量）。
+  cache_type_k: null      # 例: "q8_0"
+  cache_type_v: null
+
+  # 把视觉投影器留在 CPU，给语言侧腾显存。
+  # 这是 llama.cpp **独有**的能力，Ollama 无等效开关 —— 选 llama.cpp 的直接理由之一。
+  no_mmproj_offload: false
+
+  # chat 端点的候选路由（按顺序探测，命中即缓存并写进报告）。
+  # ⚠️ 实测 build 10951 的路由表不稳定：`/health` 返回 404；
+  #    `/v1/chat/completions` 与 `/chat/completions` 在不同启动中表现不同，
+  #    被 404 挡下的请求**不会到达模型**（响应体是静态文件兜底 handler 的 "File Not Found"）。
+  #    因此适配器改为自发现 + 缓存，并把命中的 `chat_route` 记入引擎指纹以便复核。
+  chat_routes:
+    - "/v1/chat/completions"
+    - "/chat/completions"
+
+  # ⚠️ 服务端启动时会警告：Qwen-VL 在 grounding 任务上需要 ≥1024 图像 token。
+  #    本项目合成图 448×448 → 196 视觉 token，低于该阈值；描述/OCR 类任务实测可用（HF 侧已验证），
+  #    但若后续发现定位类任务质量差，优先试这一项（会显著增加视觉 token 数，拖慢 prefill）。
+  # image_min_tokens: 1024
+
+  extra_args: []          # 逃生口：临时追加参数（会被写进报告，保证可追溯）
+
+# 本引擎对 base.yaml generation 段的覆盖
+generation: {}

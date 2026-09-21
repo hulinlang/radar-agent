@@ -1,0 +1,135 @@
+# =============================================================================
+# 公式概念表（P4-S1c · 按「名字」索引公式，而不是按字面内容）
+#
+# ■ 为什么需要它
+#   同一概念的公式在不同资料里**写法不同**，实测三层差异：
+#     ① 排版：`\frac { c } { 2 B }` vs `\frac{c}{2B}`   → 归一化已能解决
+#     ② 结构：教材写 `ΔR = cτ/2`（斜杠），标准写 `ΔR = c/(2B)`（分式）→ **字符串匹配无解**
+#     ③ 符号：同一概念有的用 B（带宽）、有的用 τ（脉宽）      → **字符串匹配无解**
+#   ② ③ 导致「按公式字面回捞」只能成功 30%（2026-09-20 实测）。
+#   → 改为给公式挂一个**概念名**（像图有 `Fig. 1` 一样），按名字检索。
+#
+# ■ 为什么用「术语锚定」而不是写公式模板
+#   术语是自然语言，**不受符号和写法影响** —— 这正是痛点所在。
+#   做法：一段文字里同时出现「该概念的术语」和「公式」→ 给这个 chunk 挂上概念名。
+#
+# ⚠️ 术语必须**完整且具体**：
+#    写「分辨率」会把多普勒分辨率、速度分辨率全卷进来；必须写「距离分辨率」。
+#    新增条目时若出现"命中过多"，先看术语是不是太短。
+#
+# ■ 种子来源
+#   22 个 `id` 直接取自 P3 出题时 `answer_check.formula` 字段（不是我编的），
+#   保证了和计算题的标准答案**同一套命名**，评测时能直接对上。
+# =============================================================================
+
+concepts:
+
+  range_resolution:
+    name: 距离分辨率
+    zh: ["距离分辨率", "距离分辨力"]
+    en: ["range resolution"]
+
+  range_resolution_tau:
+    name: 距离分辨率（脉宽形式）
+    zh: ["距离分辨率", "距离分辨尺度"]
+    en: ["range resolution"]
+
+  bandwidth_from_pulse_width:
+    name: 脉宽决定的带宽
+    zh: ["频谱宽度", "信号带宽", "脉冲宽度"]
+    en: ["bandwidth", "pulse width"]
+
+  doppler_frequency:
+    name: 多普勒频率
+    zh: ["多普勒频率", "多普勒频移"]
+    en: ["doppler frequency", "doppler shift"]
+
+  velocity_from_doppler:
+    name: 由多普勒频率反求速度
+    zh: ["径向速度", "多普勒频率"]
+    en: ["radial velocity", "doppler"]
+
+  doppler_resolution:
+    name: 多普勒分辨率
+    zh: ["多普勒分辨率", "频率分辨率"]
+    en: ["doppler resolution"]
+
+  velocity_resolution:
+    name: 速度分辨率
+    zh: ["速度分辨率"]
+    en: ["velocity resolution"]
+
+  unambiguous_range:
+    name: 最大不模糊距离
+    zh: ["最大不模糊距离", "不模糊距离"]
+    en: ["unambiguous range"]
+
+  unambiguous_velocity:
+    name: 最大不模糊速度
+    zh: ["最大不模糊速度", "不模糊速度"]
+    en: ["unambiguous velocity"]
+
+  prf_from_period:
+    name: 脉冲重复频率
+    zh: ["脉冲重复频率", "重复周期"]
+    en: ["pulse repetition frequency", "PRF"]
+
+  pulse_compression_gain:
+    name: 脉冲压缩增益
+    zh: ["脉冲压缩比", "压缩增益", "脉冲压缩增益"]
+    en: ["pulse compression ratio", "compression gain"]
+
+  pulse_compression_gain_db:
+    name: 脉冲压缩增益（分贝）
+    zh: ["脉冲压缩比", "压缩增益"]
+    en: ["pulse compression ratio", "compression gain"]
+
+  coherent_integration_gain_db:
+    name: 相干积累增益
+    zh: ["相干积累增益", "积累增益", "相参积累"]
+    en: ["coherent integration gain"]
+
+  max_detect_range:
+    name: 最大探测距离
+    zh: ["最大探测距离", "最大作用距离", "作用距离"]
+    en: ["maximum detection range", "maximum range"]
+
+  max_range_fmcw:
+    name: FMCW 最大探测距离
+    zh: ["最大探测距离", "最大作用距离"]
+    en: ["maximum range", "FMCW"]
+
+  range_from_delay:
+    name: 由时延求距离
+    zh: ["双程时延", "目标距离", "往返时间"]
+    en: ["round-trip delay", "target range"]
+
+  range_from_beat:
+    name: 差频测距
+    zh: ["差频", "拍频"]
+    en: ["beat frequency"]
+
+  chirp_slope:
+    name: 调频斜率
+    zh: ["调频斜率", "扫频斜率"]
+    en: ["chirp slope", "sweep slope"]
+
+  wavelength:
+    name: 波长
+    zh: ["工作波长", "波长"]
+    en: ["wavelength"]
+
+  noise_power:
+    name: 噪声功率
+    zh: ["噪声功率"]
+    en: ["noise power"]
+
+  snr_max_matched:
+    name: 匹配滤波最大信噪比
+    zh: ["匹配滤波", "信噪比"]
+    en: ["matched filter", "SNR"]
+
+  range_ratio_from_rcs:
+    name: 雷达截面积与距离的关系
+    zh: ["雷达截面积", "作用距离"]
+    en: ["radar cross section", "RCS"]

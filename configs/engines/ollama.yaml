@@ -1,0 +1,41 @@
+# =============================================================================
+# 引擎配置：ollama
+# 只放**本引擎独有**的运行参数。路径与生成默认值见 configs/base.yaml。
+# 定位：备选演示壳，不作为学习主线（理由见 docs/02 §2.4）
+#
+# ⚠️ 状态：本机**尚未安装 Ollama**（winget 包为 Ollama.Ollama v0.34.0）。
+#    因此本配置与对应适配器的运行路径**未经实测**。
+#    未实测的结论不得写进报告（§5.2）。首次使用前需先跑通最小用例。
+#
+# 安装与导入（从既有 GGUF 复用，避免重复下载）：
+#   winget install --id Ollama.Ollama -e
+#   ollama serve
+#   # 写 Modelfile：FROM <path>/Qwen3VL-2B-Instruct-Q4_K_M.gguf
+#   ollama create qwen3vl2b-radar -f Modelfile
+#   # 注：mmproj 的挂载方式随版本变动，需实测确认
+#
+# 能力差异备忘（适配器已用 capabilities() 声明，报告里会如实标注）：
+#   - 无 --no-mmproj-offload 等效项 → 无法把视觉投影器留在 CPU
+#   - 无 KV Cache 数据类型控制
+#   - 无法精确控制 GPU 卸载层数（num_gpu 会被自动调整）
+# =============================================================================
+
+engine:
+  name: ollama
+  display: "Ollama"
+
+model:
+  name: "qwen3vl2b-radar"     # ollama create 出来的本地模型名
+
+server:
+  host: "127.0.0.1"
+  port: 11434
+  keep_alive: "5m"
+
+# Ollama 的推理参数通过 options 传入（原生 /api/chat）。
+# 注意：这些是**服务端**参数，与 llama.cpp 的 -ngl/-c 不是同名概念，不要混用。
+options:
+  num_ctx: 8192
+  num_gpu: 99                 # 概念上类似 -ngl，但 Ollama 会自动裁剪，无法精确控制
+
+generation: {}
