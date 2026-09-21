@@ -93,10 +93,20 @@ class Engine:
         self.bad = tool_call_bad_ids(self.tok)
 
         # 语料（用于把 chunk_id 还原成原文 —— 引用可溯源要有"可点开看"的落点）
-        chunks, _ = load_corpus([("book", self.cfg["paths"]["chunks_file"]),
-                                 ("paper", self.cfg["paths"]["papers_chunks_file"])])
+        # ⚠️ 语料切片与索引**不随仓库分发**（版权 + 体积），首次 clone 后必然不存在。
+        #    这里降级而不是崩溃：模型仍可跑「无工具」模式，检索调用会返回明确错误。
+        #    `corpus_ok=false` 会体现在 /api/health，别让使用者猜。
+        try:
+            chunks, _ = load_corpus([("book", self.cfg["paths"]["chunks_file"]),
+                                     ("paper", self.cfg["paths"]["papers_chunks_file"])])
+        except Exception as exc:  # noqa: BLE001
+            chunks = []
+            print(f"[p8] ⚠️ 语料切片未加载（{type(exc).__name__}: {exc}）\n"
+                  f"     检索不可用；请先按 README「构建知识库与索引」生成 chunks.jsonl。",
+                  flush=True)
         self.by_id = {c["chunk_id"]: c for c in chunks}
         self.n_chunks = len(chunks)
+        self.corpus_ok = bool(chunks)
 
         self.lock = asyncio.Lock()
         self.ready = False
@@ -214,7 +224,7 @@ def build_app(adapter: str | None, embed_cpu: bool = False):
     @app.get("/api/health")
     def health():
         return {"ready": eng.ready, "adapter": eng.adapter, "impl": eng.impl,
-                "n_chunks": eng.n_chunks, "tools": eng.tool_names,
+                "n_chunks": eng.n_chunks, "corpus_ok": eng.corpus_ok, "tools": eng.tool_names,
                 "warm_ok": getattr(eng, "warm_ok", None),
                 "warm_s": round(getattr(eng, "warm_s", 0.0), 1)}
 

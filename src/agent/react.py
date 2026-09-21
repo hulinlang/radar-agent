@@ -35,7 +35,12 @@ from .tool_parser import TAG_OPEN, parse
 
 DEFAULTS: dict[str, Any] = {
     "max_steps": 6,
-    "max_new_tokens": 256,
+    # ⚠️ 键名必须与 `configs/agent.yaml` 的 `react.*` **逐字一致**。
+    #    2026-09-21 修复：本键原名为 `max_new_tokens`，而 yaml 里写的是
+    #    `max_new_tokens_per_step` —— 三个调用方（app.py / p7_eval_e2e.py /
+    #    p6_react_smoke.py）都用 `if k in REACT_DEFAULTS` 过滤，于是 yaml 的这一项
+    #    被**静默丢弃**（值恰好同为 256，所以行为没错、但改配置永远不生效）。
+    "max_new_tokens_per_step": 256,
     "token_budget": 6000,
     "wall_clock_s": 90,
     "step_timeout_s": 10,
@@ -140,7 +145,7 @@ def react(question: str, *, model, tok, tools_spec: list[dict],
 
         t0 = time.perf_counter()
         gen_kw: dict[str, Any] = dict(
-            max_new_tokens=int(p["max_new_tokens"]), do_sample=False,
+            max_new_tokens=int(p["max_new_tokens_per_step"]), do_sample=False,
             pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
         # 末步：屏蔽 <tool_call>，逼它出最终答案
         if is_last and bad_ids:
