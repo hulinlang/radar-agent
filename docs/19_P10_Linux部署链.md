@@ -1,6 +1,6 @@
 # 19 · P10 Linux C/C++ 部署链：LoRA→GGUF→llama-server→Agent 全对接
 
-> 拟制：2026-10-05 ｜ 状态：**A1/A2/A4/A5(GGUF 侧) 已完成；A3(WSL2 CUDA 构建) 待 Hyper-V 修复后进行**
+> 拟制：2026-10-05 ｜ 状态：**A1/A2/A3/A4 已完成；A5 = GGUF 200 题回归已出，F16 同引擎对照进行中**
 > 承接：`docs/17` §4（S1–S8 命令级方案，本文即其执行记录）、`docs/14` §5 S1（断链警告的修复）。
 > 目标升级：用户拍板项目新方向为「**基于 Linux 的 C/C++ 推理模型部署**」，路线 A（llama.cpp 部署链）
 > 先行，路线 B（自研 C/C++ 推理引擎，`radar-agent/cpp/`）随后启动。
@@ -90,25 +90,23 @@ P6 的 HF 侧护栏实测（`reports/P6_护栏验证.md`：关→4/5 会调，�
 | A 无检索基线 | 0.360 | 0.301 | 42.6% | 100.0% | 0（0） |
 | B 完整系统 | 0.305 | 0.286 | 51.0% | 78.9% | 114（**0**） |
 
-### 4.2 与 HF bf16 对照
+### 4.2 量化退化定稿（F16 同引擎对照，2026-10-06）
 
-> ⚠️ **HF bf16 + p5b_tool6 基线未产出**：2026-10-06 实跑 9 小时未完成
-> （预估 90 min，实际节奏慢约 2×；因脚本「最后一次性落盘 + 进度被管道缓冲」
-> 不可观测，用户拍板放弃）。**教训已固化**：`p7_eval_e2e.py` 已加
-> 逐题 partial 落盘 + 进度日志 + 断点续跑。
-> P7 v2（p5b_tool**5**，HF bf16）参考值：A=0.370/0.287、B=0.295/0.274——
-> 注意 tool5≠tool6，跨版本对比混了两个变量，仅作量级参照。
->
-> **替代方案（A3 后执行）**：跑 **F16 GGUF 同引擎对照**（~20 min）——
-> F16 vs Q4_K_M 同走 llama-server，干净分离「量化」这一个变量；
-> 引擎口径差（HF vs llama.cpp）由 P1 D1 已有结论覆盖。
+> ⚠️ HF bf16 基线 9h 未完成已放弃（教训固化为逐题落盘+断点续跑）。
+> 替代方案已执行：**F16 vs Q4_K_M 同走 llama-server（Windows Vulkan b10951）、同 200 题、同口径 v3**，
+> 唯一变量是量化位宽。完整报告：`reports/P10_回归对比_Q4KM_vs_F16.md`。
 
-| 指标 | F16 GGUF（未量化，同引擎） | GGUF Q4_K_M | 差值 |
+| 指标 | F16（未量化） | Q4_K_M | Δ |
 |---|---|---|---|
-| A 综合 / F1 | 待 A3 后回填 | 0.360 / 0.301 | — |
-| B 综合 / F1 | 待 A3 后回填 | 0.305 / 0.286 | — |
-| B 拒答正确 | 待 A3 后回填 | 78.9% | — |
-| B 坏引用 | 待 A3 后回填 | 0 | — |
+| A 综合 / F1 | 0.375 / 0.298 | 0.360 / 0.301 | −0.015（噪声量级） |
+| **B 综合 / F1** | 0.340 / 0.331 | 0.305 / 0.286 | **−0.035 / −0.045** |
+| B 数值命中 | 56.6% | 51.0% | −5.6pp（计算题最敏感，符合预期） |
+| B 拒答正确 | 78.9% | 78.9% | 0 |
+| B 坏引用 | 0 | 0 | 0 |
+
+**结论**：Q4_K_M 轻微但可测退化（B 组 −0.035，主因数值命中），无系统性崩塌（拒答/引用/工具链完整保留）；
+演示场景可接受，高风险场景建议 Q8_0（未测）。
+**性能**：Q4_K_M 142 tok/s（7 min 跑完 200 题）；F16 因 8GB 显存超预算仅 9.9 tok/s（不可行，仅作质量对照）。
 
 ### 4.3 性能（§5.9：延迟吞吐成对、P50/P99、服务端 timings 信源）
 
@@ -121,17 +119,42 @@ P6 的 HF 侧护栏实测（`reports/P6_护栏验证.md`：关→4/5 会调，�
 对照 P7 v2（HF bf16）：A 5197 ms、B 22022 ms → **llama-server 形态快 8.4×/14.8×**
 （⚠️ 跨 session 比较 + tool5/tool6 差异，倍率供量级参考；同 session A/B 在 A3 后补）。
 
-## 5. A3 WSL2 CUDA 源码构建（**待执行**）
+## 5. A3 WSL2 CUDA 源码构建（**已完成，2026-10-06**）
 
-- **阻塞原因**：用户临时关闭了 Hyper-V/虚拟机平台（2026-10-05 实测 `HypervisorPresent=False`），
-  WSL2 起不来；9-29 曾正常（docs/18）。用户已确认重新开启，待重启后执行。
-- 修复命令（管理员 PowerShell + 重启）：
-  `dism /online /enable-feature /featurename:VirtualMachinePlatform /all` + WSL 功能 + 
-  `bcdedit /set {current} hypervisorlaunchtype auto`。
-- 自动化脚本已备好：`scripts/p10_wsl_setup.sh`（guest 内幂等执行：apt 工具链 →
-  nvidia-cuda-toolkit（~1.5GB，执行前需用户确认下载）→ 从 Windows 侧浅克隆取 b10951 源码 →
-  cmake GGML_CUDA sm_89 构建 → GGUF 拷贝到 guest 本地盘消除 9P）。
-- 对接方式不变：`p10_serve_gguf.py --external-url http://127.0.0.1:8080`。
+### 5.1 结果
+
+| 项 | 实测 |
+|---|---|
+| 环境 | WSL2 Ubuntu-24.04 + gcc 13.3 + cmake 3.28.3 + nvidia-cuda-toolkit **12.0.140**（apt，~1.5GB） |
+| 构建 | `cmake -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89`，commit 093a2f8（与 Windows b10951 同源），**~10 min 编译完成** |
+| 产物 | `~/llama.cpp/build/bin/llama-server`（动态后端：libggml-cuda.so）；模型拷到 guest 本地盘 `~/models/`（消除 9P） |
+| 冒烟 | 距离分辨率题输出与 HF/Vulkan **逐字一致**（1.5 m）；decode **118.6 tok/s**（CUDA）vs 37.8 tok/s（同机 CPU 对照）→ GPU 真在用 |
+| 服务化 | guest 内常驻 `--host 0.0.0.0 --port 8080`，Windows 经 localhost 转发直连 `/props` 200 ✅ |
+| 演示对接 | `p10_serve_gguf.py --external-url http://127.0.0.1:8080`：ReAct 调 calc 正确作答 ✅ |
+| 链路形态 | **浏览器 → FastAPI(Windows) → ReAct(Python) → llama-server(WSL2 Linux, CUDA)** |
+
+脚本：`p10_wsl_setup.sh`（幂等构建）+ `p10_wsl_server_start.sh`（常驻服务）+ `p10_wsl_server_full.sh`（冒烟）。
+
+### 5.2 踩坑实录（都是真教训）
+
+1. **Git Bash 路径转换**：`wsl.exe -- bash /mnt/f/...` 中的 `/mnt/f` 被 MSYS 转成 `E:/Git/mnt/f` →
+   脚本找不到。对策：`MSYS2_ARG_CONV_EXCL="*"`。
+2. **NVIDIA 驱动回退事故**：9-29（docs/18）时宿主驱动 615.71（CUDA UMD 13.4）→ 本次重启后变成
+   **560.94（CUDA 12.6）**。后果：guest 内 vllm-env（torch cu130）直接报废（"driver too old"）。
+   llama.cpp 用 CUDA 12.0 编译，12.6 驱动向下兼容，故不受影响。
+   **教训：驱动版本是环境指纹的一部分，变更必须记录**（vllm-env 修复 = 宿主装回新驱动，暂缓）。
+3. **llama-cli "挂死"假象（本次最大的坑，排查约 1 h）**：模型运行零输出、进程不死、SIGTERM 无效。
+   strace 真相：**它在交互 TUI 里等 /dev/tty 输入**（wsl 会话无 TTY），且 stdout 重定向后块缓冲，
+   SIGKILL 强杀导致缓冲区丢失 → 呈现"零输出挂死"。两个独立假象叠加（TUI 等输入 + 缓冲丢失），
+   先用 `--list-devices`（4s 返回）排除了 CUDA 枚举，再用 server（无 TUI）A/B 证明加载本身 4s 完成。
+   **对策：guest 内一律用 llama-server 验证，不用 llama-cli 交互模式；杀进程留时间让缓冲 flush。**
+4. `pkill -f` 的模式串会匹配**自己所在的命令行** → 自杀（exit 9）。对策：`pkill -x <精确进程名>`。
+5. `timeout 60` 不带 `-k`：对忽略 SIGTERM 的进程会**永远等下去**。对策：`timeout -k 5 60`。
+
+### 5.3 与 vLLM 路线（docs/18）的关系
+
+两条 Linux GPU 链现在都通：vLLM（torch cu130，**当前因驱动回退不可用**）与 llama.cpp CUDA 12.0（可用）。
+WSL2 内 CUDA 推理的最低可用栈已沉淀为脚本，可复现。
 
 ## 6. 新文件清单
 
@@ -151,8 +174,9 @@ P6 的 HF 侧护栏实测（`reports/P6_护栏验证.md`：关→4/5 会调，�
 
 ## 7. 下一步
 
-1. **用户重启后**：跑 A3 → WSL2 CUDA llama-server 冒烟 → 同 session A/B（CUDA vs Vulkan vs HF）。
-2. **A3 之后**：F16 GGUF 同引擎对照（200 题，~20 min）回填 §4.2 → 量化退化结论定稿。
+1. ~~A3 WSL2 CUDA 构建~~ → ✅ 已完成（§5）。
+2. **F16 GGUF 同引擎对照**（200 题，进行中）→ 回填 §4.2 → 量化退化结论定稿。
 3. 路线 B 启动：`radar-agent/cpp/` 自研 C/C++ 推理引擎（B0 立项：GGUF 格式 + Qwen3 架构阅读），
    用 A 阶段的 GGUF 与 llama.cpp 输出做逐层对拍。
-4. 遗留（不阻塞）：量化三档 Pareto（docs/17 S8）、vLLM 同 session 对比（docs/18 §6 #4）。
+4. 遗留（不阻塞）：宿主 NVIDIA 驱动装回新版以修复 vllm-env（cu130）；量化三档 Pareto（docs/17 S8）；
+   vLLM 同 session 对比（docs/18 §6 #4）。

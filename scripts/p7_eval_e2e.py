@@ -124,7 +124,9 @@ def main() -> int:
                     help="hf=进程内加载（原形态）；llamacpp=生成走外部 llama-server（P10 部署形态）")
     ap.add_argument("--llama-url", default="http://127.0.0.1:8080")
     ap.add_argument("--spawn-server", action="store_true",
-                    help="按 configs/deploy_gguf.yaml 自动拉起本地 llama-server，评测结束自动关闭")
+                    help="按部署配置自动拉起本地 llama-server，评测结束自动关闭")
+    ap.add_argument("--deploy-config", default="configs/deploy_gguf.yaml",
+                    help="--spawn-server 用的部署配置；F16 对照用 configs/deploy_gguf_f16.yaml")
     args = ap.parse_args()
 
     # ✗/✓ 等符号在 GBK 控制台下会 UnicodeEncodeError（§4.4）
@@ -200,7 +202,7 @@ def main() -> int:
             from src.engines import substitute_paths
             from src.engines.llamacpp_engine import LlamaCppEngine
             deploy = yaml.safe_load(
-                (PROJECT_ROOT / "configs" / "deploy_gguf.yaml").read_text(encoding="utf-8"))
+                (PROJECT_ROOT / args.deploy_config).read_text(encoding="utf-8"))
             substitute_paths(deploy, cfg)
             server_engine = LlamaCppEngine(deploy, cfg)
             print("[e2e] 拉起 llama-server（SFT Q4_K_M）…", flush=True)
@@ -413,7 +415,10 @@ def main() -> int:
     model_label = (
         (Path(args.adapter).name if args.adapter else "基座")
         if args.backend == "hf" else
-        f"qwen3vl-sft-Q4_K_M GGUF（llama-server {args.llama_url}）"
+        # 模型名从部署配置取（Q4_K_M 主部署 / F16 对照共用同一评测脚本）
+        Path(yaml.safe_load((PROJECT_ROOT / args.deploy_config)
+                            .read_text(encoding="utf-8"))["model"]["llm_path"]).name
+        + f"（llama-server {args.llama_url}）"
     )
     A("# P7 · 端到端评测：最终答案质量")
     A("")
