@@ -19,6 +19,9 @@
 #include "gguf.h"
 #include "model.h"
 #include "tokenizer.h"
+#ifdef USE_CUDA
+#include "gpu_model.h"
+#endif
 
 namespace {
 
@@ -122,9 +125,52 @@ int main(int argc, char** argv) {
         if (ids.empty()) throw std::runtime_error("prompt encodes to zero tokens");
         if (kv_cap <= 0) kv_cap = static_cast<int>(ids.size()) + n_predict + 8;
         const bool use_blas = backend == "blas";
-        if (backend != "omp" && !use_blas) throw std::runtime_error("unknown --backend " + backend);
+        const bool use_cuda = backend == "cuda";
+        if (backend != "omp" && !use_blas && !use_cuda) throw std::runtime_error("unknown --backend " + backend);
         std::fprintf(stderr, "prompt: %zu tokens, kv_cap=%d, eos=%d, backend=%s\n",
                      ids.size(), kv_cap, tok.eos(), backend.c_str());
+
+#ifdef USE_CUDA
+        if (use_cuda) {
+            ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap);
+            const auto t0 = Clock::now();
+            int32_t next = 0;
+            for (size_t i = 0; i < ids.size(); ++i) next = gpu.forward_argmax(ids[i], static_cast<int>(i));
+            const auto t1 = Clock::now();
+
+            if (!teacher_path.empty()) {
+                const std::vector<int32_t> teacher = read_id_list(teacher_path);
+                int agree = 0, pos = static_cast<int>(ids.size());
+                int32_t cur = next;
+                for (int32_t forced : teacher) {
+                    if (cur == forced) ++agree;
+                    cur = gpu.forward_argmax(forced, pos++);
+                }
+                std::printf("teacher-agreement: %d/%zu (%.1f%%)\n", agree, teacher.size(),
+                            100.0 * agree / teacher.size());
+                return 0;
+            }
+
+            std::vector<int32_t> gen;
+            int pos = static_cast<int>(ids.size());
+            while (static_cast<int>(gen.size()) < n_predict && next != tok.eos()) {
+                gen.push_back(next);
+                next = gpu.forward_argmax(next, pos++);
+            }
+            const auto t2 = Clock::now();
+            const double pre_s = secs(t0, t1), dec_s = secs(t1, t2);
+            std::fprintf(stderr,
+                         "prefill: %zu tokens in %.2fs (%.1f tok/s)\n"
+                         "decode:  %zu tokens in %.2fs (%.2f tok/s)\n",
+                         ids.size(), pre_s, ids.size() / pre_s,
+                         gen.size(), dec_s, dec_s > 0 ? gen.size() / dec_s : 0.0);
+            std::printf("%s\n", tok.decode(gen).c_str());
+            if (!ids_out.empty()) write_ids(ids_out, ids, gen);
+            return 0;
+        }
+#else
+        if (use_cuda) throw std::runtime_error("built without CUDA support");
+#endif
 
         ri::Model model = ri::Model::load(f, kv_cap, false, use_blas);
 

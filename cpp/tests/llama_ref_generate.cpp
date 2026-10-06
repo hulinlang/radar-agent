@@ -75,6 +75,7 @@ std::vector<int32_t> read_id_list(const std::string& path) {
 int main(int argc, char** argv) {
     std::string model_path, prompt, teacher_path;
     int n_predict = 100;
+    int ngl = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* name) -> std::string {
@@ -85,6 +86,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-file") prompt = read_file(need("--prompt-file"));
         else if (a == "--n-predict") n_predict = std::stoi(need("--n-predict"));
         else if (a == "--teacher-file") teacher_path = need("--teacher-file");
+        else if (a == "--ngl") ngl = std::stoi(need("--ngl"));
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty() || prompt.empty()) {
@@ -94,7 +96,7 @@ int main(int argc, char** argv) {
     try {
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
-        mp.n_gpu_layers = 0;  // CPU reference semantics
+        mp.n_gpu_layers = ngl;
         llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
         if (!model) throw std::runtime_error("failed to load model");
         const llama_vocab* vocab = llama_model_get_vocab(model);
