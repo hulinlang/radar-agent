@@ -14,6 +14,9 @@ void rmsnorm(const float* x, const float* w, float* y, int n, float eps) {
 }
 
 void matvec_f16(const uint16_t* w, const float* x, float* y, int in, int out) {
+    // Row-partitioned: each row's dot product keeps its sequential accumulation
+    // order, so the result is bit-identical to the single-threaded version.
+    #pragma omp parallel for schedule(static)
     for (int j = 0; j < out; ++j) {
         const uint16_t* row = w + static_cast<size_t>(j) * in;
         float acc = 0.0f;

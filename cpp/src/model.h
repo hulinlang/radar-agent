@@ -28,7 +28,9 @@ class Model {
 public:
     // kv_cap: max tokens the KV cache can hold (prompt + generated).
     // trace: when true, each layer's output hidden state is copied into trace().
-    static Model load(const GGUFFile& f, int kv_cap, bool trace = false);
+    // use_blas: convert all weights to F32 at load and use cblas_sgemv
+    //           (B5b control path; memory-bandwidth-bound by design).
+    static Model load(const GGUFFile& f, int kv_cap, bool trace = false, bool use_blas = false);
 
     const ModelConfig& config() const { return cfg_; }
 
@@ -42,23 +44,31 @@ public:
     const std::vector<float>& trace_layer(int l) const { return trace_layers_[l]; }
     const std::vector<float>& trace_final_norm() const { return trace_final_; }
 
+    // A weight tensor view: raw bytes + ggml type (F16=1, Q4_K=12, Q6_K=14).
+    struct W {
+        const uint8_t* p;
+        uint32_t type;
+    };
+
 private:
     struct LayerWeights {
         const float* attn_norm;    // F32 [hidden]
-        const uint16_t* wq;        // F16 [hidden, n_head*head_dim]
-        const uint16_t* wk;        // F16 [hidden, n_kv_head*head_dim]
-        const uint16_t* wv;
+        W wq;                      // [hidden, n_head*head_dim]
+        W wk;                      // [hidden, n_kv_head*head_dim]
+        W wv;
         const float* q_norm;       // F32 [head_dim]
         const float* k_norm;       // F32 [head_dim]
-        const uint16_t* wo;        // F16 [n_head*head_dim, hidden]
+        W wo;                      // [n_head*head_dim, hidden]
         const float* ffn_norm;     // F32 [hidden]
-        const uint16_t* wg;        // F16 [hidden, ffn]
-        const uint16_t* wu;        // F16 [hidden, ffn]
-        const uint16_t* wd;        // F16 [ffn, hidden]
+        W wg;                      // [hidden, ffn]
+        W wu;                      // [hidden, ffn]
+        W wd;                      // [ffn, hidden]
     };
 
     ModelConfig cfg_;
-    const uint16_t* token_embd_ = nullptr;  // F16 [hidden, vocab]
+    W token_embd_{};               // [hidden, vocab]
+    // BLAS path: weights converted to F32 once at load, owned here.
+    std::vector<std::vector<float>> owned_f32_;
     std::vector<float> output_norm_;        // F32 [hidden]
     std::vector<LayerWeights> layers_;
     // Norm weights converted to F32 at load (small); owned here.

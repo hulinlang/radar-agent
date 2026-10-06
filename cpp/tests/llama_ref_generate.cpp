@@ -6,6 +6,8 @@
 
 #include "llama.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,16 +32,48 @@ int32_t argmax(const float* v, int n) {
     return best;
 }
 
+// REF_DEBUG_TOPK=K: per generated step, print top-K (id:logit) to stderr.
+void debug_topk(const float* v, int n, int step) {
+    const char* env = std::getenv("REF_DEBUG_TOPK");
+    if (!env) return;
+    const int k = std::atoi(env);
+    std::vector<int32_t> idx(n);
+    for (int i = 0; i < n; ++i) idx[i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                      [&](int32_t a, int32_t b) { return v[a] > v[b]; });
+    std::fprintf(stderr, "step %d:", step);
+    for (int i = 0; i < k; ++i) std::fprintf(stderr, " %d:%.6f", idx[i], v[idx[i]]);
+    std::fprintf(stderr, "\n");
+}
+
 void print_ids(const char* tag, const std::vector<llama_token>& ids) {
     std::printf("%s", tag);
     for (llama_token t : ids) std::printf(" %d", t);
     std::printf("\n");
 }
 
+std::vector<int32_t> read_id_list(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open " + path);
+    std::vector<int32_t> ids;
+    std::string tok;
+    while (in >> tok) {
+        size_t b = 0;
+        while (b < tok.size()) {
+            size_t e = tok.find(',', b);
+            std::string part = tok.substr(b, e == std::string::npos ? e : e - b);
+            if (!part.empty() && part != "PROMPT" && part != "GEN") ids.push_back(std::stoi(part));
+            if (e == std::string::npos) break;
+            b = e + 1;
+        }
+    }
+    return ids;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, prompt;
+    std::string model_path, prompt, teacher_path;
     int n_predict = 100;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -50,6 +84,7 @@ int main(int argc, char** argv) {
         if (a == "--model") model_path = need("--model");
         else if (a == "--prompt-file") prompt = read_file(need("--prompt-file"));
         else if (a == "--n-predict") n_predict = std::stoi(need("--n-predict"));
+        else if (a == "--teacher-file") teacher_path = need("--teacher-file");
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty() || prompt.empty()) {
@@ -80,15 +115,44 @@ int main(int argc, char** argv) {
         std::vector<llama_token> gen;
 
         llama_batch batch = llama_batch_get_one(toks.data(), n);
+        const auto t0 = std::chrono::steady_clock::now();
         if (llama_decode(ctx, batch) != 0) throw std::runtime_error("prefill decode failed");
+        const auto t1 = std::chrono::steady_clock::now();
         int32_t next = argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+
+        if (!teacher_path.empty()) {
+            const std::vector<int32_t> teacher = read_id_list(teacher_path);
+            int agree = 0;
+            int32_t cur = next;
+            for (int32_t forced : teacher) {
+                if (cur == forced) ++agree;
+                llama_token t = forced;
+                batch = llama_batch_get_one(&t, 1);
+                if (llama_decode(ctx, batch) != 0) throw std::runtime_error("decode failed");
+                cur = argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+            }
+            std::printf("teacher-agreement: %d/%zu (%.1f%%)\n", agree, teacher.size(),
+                        100.0 * agree / teacher.size());
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
+        }
 
         while (static_cast<int>(gen.size()) < n_predict && !llama_vocab_is_eog(vocab, next)) {
             gen.push_back(next);
             batch = llama_batch_get_one(&gen.back(), 1);
             if (llama_decode(ctx, batch) != 0) throw std::runtime_error("decode failed");
             next = argmax(llama_get_logits_ith(ctx, -1), n_vocab);
+            debug_topk(llama_get_logits_ith(ctx, -1), n_vocab, static_cast<int>(gen.size()));
         }
+
+        const auto t2 = std::chrono::steady_clock::now();
+        const double pre_s = std::chrono::duration<double>(t1 - t0).count();
+        const double dec_s = std::chrono::duration<double>(t2 - t1).count();
+        std::fprintf(stderr, "prefill: %d tokens in %.2fs (%.1f tok/s)\ndecode:  %zu tokens in %.2fs (%.2f tok/s)\n",
+                     n, pre_s, n / pre_s, gen.size(), dec_s,
+                     dec_s > 0 ? gen.size() / dec_s : 0.0);
 
         print_ids("PROMPT", toks);
         print_ids("GEN", gen);
