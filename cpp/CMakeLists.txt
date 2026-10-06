@@ -20,3 +20,6 @@ add_executable(radar-infer src/main.cpp)
 
 # B1：GGUF 加载器 + 规范化 dump 工具
 add_executable(gguf-dump src/gguf.cpp src/gguf_dump.cpp)
+
+# B2：byte-level BPE 分词器 + 对拍测试
+add_executable(tokenizer-test src/gguf.cpp src/tokenizer.cpp src/tokenizer_test.cpp)
