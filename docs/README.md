@@ -116,6 +116,7 @@
 | **英文文献入库范围（D2）** | 知识库 38 篇 → **入库 35 篇**（501 页零失败），跳过 3 篇：扫描件 1 篇（145 字/页，正文是整页位图）+ 用户拍板的 2 篇大部头（DTIC 179 页≈47 min / Boyd ADMM 125 页≈33 min）。⚠️ 跳过后「ADMM 相关检索」无原文可引，加回只需删 `SKIP_BODY` 对应键 | 用户 2026-09-20 拍板；`scripts/p4_mineru_papers.py` |
 | **文献切分粒度（D4）** | **按 section 切**（title 块做硬边界，覆盖率 100% 远优于正则的 49%），摘要独立成 chunk，图/表额外出独立 chunk 挂 `parent_id`。摘要需兼容**两种形态**（paragraph `Abstract—` / title 块 `Abstract`）与**中英双语**（`摘要：`） | 用户 2026-09-19 拍板；`src/retrieval/paper_chunk.py` |
 | **教材 / 文献索引关系（D3）** | ⚠️ **2026-09-20 修订：统一入库，不再分开建库**。三源（book / mmwave / paper）进同一索引 `index/unified`，默认全库查询；分开能力改由 `sources.json` 提供（检索时按 `source_id` 前缀过滤），P4-S2 照样能做「教材-only vs 全库」A/B。<br>**修订依据**：bge-m3 跨语言实测 中文→英文 **0.556~0.595 且 4/4 排序正确**（`logs/probe/p4_bge_stdout.txt`）；⚠️ 但那是**理想句对**的实测，是**上界不是期望值**，故 A/B 仍必须做。原决策（分开）的风险此时已由 `sources` 过滤消除 | 用户 2026-09-19 拍板 → 2026-09-20 修订；`src/retrieval/index.py` |
+| **阶段 B「手写 vs 接库」边界** | **前向图/KV cache/采样手写（引擎本体）+ GEMM 走 OpenBLAS 主线、HTTP/JSON 接库（生产做法）**；分词器手写仅为学习验证（生产等价物 tokenizers-cpp） | 用户 2026-10-06 拍板；`docs/20` §5.2b |
 | 项目根 | `F:\Qwen3-2B\radar-agent\` | 本文件 |
 | 基座模型位置 | `F:\Qwen3-2B\dir\`（**不搬移**，config 用绝对路径引用） | §4.1 |
 

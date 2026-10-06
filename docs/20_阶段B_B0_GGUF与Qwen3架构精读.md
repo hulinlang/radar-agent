@@ -198,8 +198,20 @@ radar-agent/cpp/
 | B2 | BPE 分词器 | 与 transformers 对拍 100 句 id 全同 |
 | B3 | CPU 前向（F16 权重 F32 计算） | HF dump 每层 hidden state，逐层余弦相似度 ≈1、最大绝对误差 < 1e-3 |
 | B4 | 端到端 greedy | 与 llama.cpp 同 prompt 前 100 个 token 逐一相同 |
-| B5 | 性能：多线程 matvec + Q4_K_M dequant | Q4 模型可用；tok/s 对照 llama.cpp CPU 版有量化结论（不追求打平，追求知道差在哪） |
-| B6+（可选） | CUDA kernel / HTTP 服务化 / LoRA 热加载 | 视进度立项 |
+| B5 | 性能：**手写朴素 matmul（教学对照）→ OpenBLAS 主线** + Q4_K/Q6_K dequant | Q4 模型可用；手写 vs BLAS vs llama.cpp CPU 三方实测对比（目标：BLAS 主线 ≥ llama.cpp CPU decode 的 50%） |
+| B6+（可选） | CUDA kernel / HTTP 服务化（**接 cpp-httplib + nlohmann/json，不手写 socket**）/ LoRA 热加载 | 视进度立项 |
+
+### 5.2b 「手写 vs 接库」边界（2026-10-06 用户拍板）
+
+项目要对齐**实际业务开发流程**：知道每个环节生产上用什么、为什么、出问题去哪查，而不是所有轮子都造一遍。边界一句话：**"算子怎么组织成前向"手写（这是引擎本体，vLLM/llama.cpp 同样手写）；"算子里的重计算"和"外围设施"接库（这是生产）**。
+
+| 组件 | 生产等价物 | 本项目做法 |
+|---|---|---|
+| 分词器 | `tokenizers-cpp`（HF Rust 核心 C API） | 手写 + 100 句对拍（B2，学习验证；知道生产上该换什么） |
+| GEMM | OpenBLAS / MKL / cuBLAS（**生产上无引擎手写 GEMM 主线**） | 手写朴素版当教学对照，**OpenBLAS 为主线**（B5） |
+| 前向图（norm/RoPE/attention/KV cache/采样循环） | **无库可接**——这就是推理引擎的定义 | 手写（B3/B4），逐 token 对拍兜底 |
+| 量化 dequant kernel | 无独立库（各引擎照 ggml 语义自写） | 手写朴素版（B5） |
+| HTTP / JSON | cpp-httplib / nlohmann-json | 直接接库（B6） |
 
 ### 5.3 风险清单（按翻车概率排序）
 
