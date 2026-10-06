@@ -15,8 +15,8 @@ if(HAS_MARCH_NATIVE)
   add_compile_options(-march=native)
 endif()
 
-# B0 骨架：仅冒烟可执行文件；B2 起接入 tokenizer / model
-add_executable(radar-infer src/main.cpp)
+# B4：端到端 CLI（分词 + 前向 + greedy 生成）
+add_executable(radar-infer src/gguf.cpp src/tokenizer.cpp src/ops.cpp src/model.cpp src/main.cpp)
 
 # B1：GGUF 加载器 + 规范化 dump 工具
 add_executable(gguf-dump src/gguf.cpp src/gguf_dump.cpp)
