@@ -23,3 +23,6 @@ add_executable(gguf-dump src/gguf.cpp src/gguf_dump.cpp)
 
 # B2：byte-level BPE 分词器 + 对拍测试
 add_executable(tokenizer-test src/gguf.cpp src/tokenizer.cpp src/tokenizer_test.cpp)
+
+# B3：CPU 前向（语义基准）+ 逐层对拍
+add_executable(forward-test src/gguf.cpp src/ops.cpp src/model.cpp src/forward_test.cpp)

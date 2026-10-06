@@ -1,0 +1,17 @@
+{
+  "prompt": "雷达的工作原理是什么？",
+  "ids": [
+    110925,
+    104066,
+    105318,
+    102021,
+    11319
+  ],
+  "T": 5,
+  "hidden": 2048,
+  "model_n_layer": 28,
+  "raw_layer_dumps": 27,
+  "has_final_norm": true,
+  "vocab": 151936,
+  "argmax_last": 110925
+}
