@@ -50,6 +50,19 @@ ID_RE = re.compile(r"\b(?:book|mmwave|paper)_[A-Za-z0-9_\-]+")
 PCT = lambda x: "%.1f%%" % (100.0 * x)
 
 
+def _pctile(xs, p: float) -> float:
+    """线性插值分位数；空列表返回 0（调用方只在有数据时展示）。"""
+    xs = sorted(float(x) for x in xs)
+    if not xs:
+        return 0.0
+    if len(xs) == 1:
+        return xs[0]
+    k = (len(xs) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
 def load_scorer():
     """判分器 = `src/eval/scoring.py`（口径 v3，**与 P5/P5b 同一把尺子**）。
 
@@ -106,7 +119,16 @@ def main() -> int:
                     help="只跑指定题型（逗号分隔），用于小样本根因诊断（如 calc）")
     ap.add_argument("--tag", default="e2e")
     ap.add_argument("--seed", type=int, default=42)
+    # ---- P10：llama-server 部署形态（GGUF）----
+    ap.add_argument("--backend", choices=["hf", "llamacpp"], default="hf",
+                    help="hf=进程内加载（原形态）；llamacpp=生成走外部 llama-server（P10 部署形态）")
+    ap.add_argument("--llama-url", default="http://127.0.0.1:8080")
+    ap.add_argument("--spawn-server", action="store_true",
+                    help="按 configs/deploy_gguf.yaml 自动拉起本地 llama-server，评测结束自动关闭")
     args = ap.parse_args()
+
+    # ✗/✓ 等符号在 GBK 控制台下会 UnicodeEncodeError（§4.4）
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     import torch
     import yaml
@@ -166,19 +188,39 @@ def main() -> int:
           f"（索引子集 {n_idx} 条，差 {len(all_ids) - n_idx} 条为被排除的元数据区）",
           flush=True)
 
-    # ---------------- 模型 ----------------
+    # ---------------- 模型 / 生成后端 ----------------
     tok = AutoTokenizer.from_pretrained(cfg["paths"]["model_base_dir"], trust_remote_code=False)
-    model, impl, _ = load_model(cfg["paths"]["model_base_dir"], dtype="bfloat16", device="cuda")
-    if args.adapter:
-        from peft import PeftModel
-        ap_ = Path(args.adapter)
-        if not ap_.is_absolute():
-            ap_ = PROJECT_ROOT / ap_
-        model = PeftModel.from_pretrained(model, str(ap_))
-        print(f"[e2e] 已挂载 adapter: {ap_.name}", flush=True)
     bad = tool_call_bad_ids(tok)
-    snap = mem_snapshot("cuda")
-    print(f"[e2e] 模型已加载 attn={impl} 显存={fmt_bytes(snap['allocated'])}", flush=True)
+    gen_backend = None
+    model = None
+    server_engine = None
+    if args.backend == "llamacpp":
+        from src.engines.react_llamacpp import LlamaCppGenBackend
+        if args.spawn_server:
+            from src.engines import substitute_paths
+            from src.engines.llamacpp_engine import LlamaCppEngine
+            deploy = yaml.safe_load(
+                (PROJECT_ROOT / "configs" / "deploy_gguf.yaml").read_text(encoding="utf-8"))
+            substitute_paths(deploy, cfg)
+            server_engine = LlamaCppEngine(deploy, cfg)
+            print("[e2e] 拉起 llama-server（SFT Q4_K_M）…", flush=True)
+            server_engine.start()
+        gen_backend = LlamaCppGenBackend(tok, base_url=args.llama_url)
+        impl = "llamacpp(外部服务)"
+        print(f"[e2e] 生成后端 = llama-server {args.llama_url}"
+              f"（进程内不加载模型权重）", flush=True)
+    else:
+        from src.modeling import load_model, mem_snapshot, fmt_bytes
+        model, impl, _ = load_model(cfg["paths"]["model_base_dir"], dtype="bfloat16", device="cuda")
+        if args.adapter:
+            from peft import PeftModel
+            ap_ = Path(args.adapter)
+            if not ap_.is_absolute():
+                ap_ = PROJECT_ROOT / ap_
+            model = PeftModel.from_pretrained(model, str(ap_))
+            print(f"[e2e] 已挂载 adapter: {ap_.name}", flush=True)
+        snap = mem_snapshot("cuda")
+        print(f"[e2e] 模型已加载 attn={impl} 显存={fmt_bytes(snap['allocated'])}", flush=True)
 
     t0 = time.perf_counter()
     warm = registry.run("corpus_search", {"query": "雷达", "top_k": 1})
@@ -187,6 +229,11 @@ def main() -> int:
 
     # ---------------- 生成 helper ----------------
     def gen(messages, tools=None, block_tool_call=False):
+        if gen_backend is not None:
+            # llama-server 路径：渲染与生成在后端内完成；
+            # block_tool_call → logit_bias 屏蔽 <tool_call>（等效 bad_words_ids，已实测）
+            seg, _n = gen_backend(messages, tools, args.max_new, block_tool_call)
+            return seg.strip()
         prompt = tok.apply_chat_template(messages, tools=tools, tokenize=False,
                                          add_generation_prompt=True)
         ids = tok(prompt, return_tensors="pt").to("cuda")
@@ -217,6 +264,42 @@ def main() -> int:
     results = {g: [] for g in groups}
     t_all = time.perf_counter()
 
+    def drain_perf() -> list:
+        """取走本题的 llama-server 逐次计时（§5.9 性能数据的服务端信源）。"""
+        if gen_backend is None:
+            return []
+        out = list(gen_backend.timings_log)
+        gen_backend.timings_log.clear()
+        return out
+
+    # ---- 断点续跑（§四.11 教训的修复，2026-10-06）----
+    # 事故：HF 基线 200 题跑 9h+，因「最后一次性落盘 + 进度被 tail 缓冲」
+    # 完全不可观测、不可续跑。现在每题立即写 partial 文件（带 group），
+    # 重跑自动跳过已完成的 (id, group)。
+    partial_path = REPORT / f"p7_e2e_{args.tag}.partial.jsonl"
+    done: set = set()
+    if partial_path.exists():
+        with partial_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                grp = row.get("group")
+                if grp in results:
+                    results[grp].append(row)
+                    done.add((row.get("id"), grp))
+        print(f"[e2e] 续跑：从 {partial_path.name} 恢复 {len(done)} 条", flush=True)
+    partial_fh = partial_path.open("a", encoding="utf-8")
+    progress_fh = (Path(cfg["paths"]["logs"])
+                   / f"p7_e2e_{args.tag}_progress.log").open("a", encoding="utf-8")
+
+    def record(g: str, row: dict) -> None:
+        """登记一条结果：进内存 + 立即落盘（带 group，供续跑去重）。"""
+        row["group"] = g
+        results[g].append(row)
+        partial_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        partial_fh.flush()
+
     for i, r in enumerate(sample, 1):
         rid = r.get("id")
         q = question_of(r)
@@ -226,26 +309,29 @@ def main() -> int:
         gold_ids = sorted(g["gold_ids"]) if g else []
 
         # ---- A 无检索基线 ----
-        if "A" in groups:
+        if "A" in groups and (rid, "A") not in done:
             # ⚠️ 屏蔽 `<tool_call>`：A 组**没有工具可执行**，若放任它输出调用块，
             #    答案就是一段无效 JSON，既不得分也不拒答 → 基线被人为压低。
             #    v1 实测：不屏蔽时 calc 题有 2/5 直接输出 `<tool_call>...`，全部判 0。
             #    这本身是个真实发现（微调后模型倾向调工具），但**基线**要测的是
             #    "不能调工具时它能答多好"，所以屏蔽，测出来的才是模型自身的知识。
             t = time.perf_counter()
+            drain_perf()  # 清掉上一题残留，保证本题区间干净
             pred = gen([{"role": "system", "content": SYSTEM_PLAIN},
                         {"role": "user", "content": q}], block_tool_call=True)
-            results["A"].append(mk_row(r, q, pred, 0, 0.0,
-                                       (time.perf_counter() - t) * 1000, all_ids, gold_ids))
+            record("A", mk_row(r, q, pred, 0, 0.0,
+                               (time.perf_counter() - t) * 1000, all_ids, gold_ids,
+                               perf=drain_perf()))
 
         # ---- B 完整系统（ReAct）----
-        if "B" in groups:
+        if "B" in groups and (rid, "B") not in done:
             tool_ms_box[0] = 0.0
             t = time.perf_counter()
+            drain_perf()
             trace = []
             try:
                 rr = react(q, model=model, tok=tok, tools_spec=tools_spec,
-                           bad_ids=bad, execute=timed_run)
+                           bad_ids=bad, execute=timed_run, gen_backend=gen_backend)
                 pred, nsteps = rr.answer, len(rr.steps)
                 trace = [{"step": s.step, "status": s.status, "calls": s.calls,
                           "obs": [(o or "")[:400] for o in s.observations],
@@ -254,11 +340,12 @@ def main() -> int:
                 print(f"  ✗ {rid} react 异常 {type(exc).__name__}: {exc}", flush=True)
                 pred, nsteps = "", 0
             wall = (time.perf_counter() - t) * 1000
-            results["B"].append(mk_row(r, q, pred, nsteps, tool_ms_box[0], wall,
-                                       all_ids, gold_ids, trace=trace))
+            record("B", mk_row(r, q, pred, nsteps, tool_ms_box[0], wall,
+                               all_ids, gold_ids, trace=trace,
+                               perf=drain_perf()))
 
         # ---- C 黄金上下文 ----
-        if "C" in groups:
+        if "C" in groups and (rid, "C") not in done:
             ctx = build_ctx(gold_ids, by_id, args.ctx_chars)
             t = time.perf_counter()
             if ctx:
@@ -272,21 +359,26 @@ def main() -> int:
                 pred = gen([{"role": "system", "content": SYSTEM_PLAIN},
                             {"role": "user", "content": q}])
                 note = "无 gold → 退化为无资料"
-            results["C"].append(mk_row(r, q, pred, 0, 0.0,
-                                       (time.perf_counter() - t) * 1000, all_ids, gold_ids,
-                                       note=note))
+            record("C", mk_row(r, q, pred, 0, 0.0,
+                               (time.perf_counter() - t) * 1000, all_ids, gold_ids,
+                               note=note))
             n_noctx[0] += 0 if ctx else 1
 
         # ---- D 随机上下文 ----
-        if "D" in groups:
+        if "D" in groups and (rid, "D") not in done:
             n = max(1, len(gold_ids))
             picks = rnd.sample(sorted(by_id), min(n + 2, len(by_id)))
             ctx = build_ctx(picks, by_id, args.ctx_chars)
             t = time.perf_counter()
             pred = gen([{"role": "system", "content": SYSTEM_WITH_CTX.format(context=ctx)},
                         {"role": "user", "content": q}])
-            results["D"].append(mk_row(r, q, pred, 0, 0.0,
-                                       (time.perf_counter() - t) * 1000, all_ids, gold_ids))
+            record("D", mk_row(r, q, pred, 0, 0.0,
+                               (time.perf_counter() - t) * 1000, all_ids, gold_ids))
+
+        # 每题一条进度日志（落盘，不依赖 stdout 可见性）
+        progress_fh.write(f"{time.strftime('%H:%M:%S')} 题 {i}/{len(sample)} "
+                          f"id={rid} 完成\n")
+        progress_fh.flush()
 
         if i % 5 == 0 or i == len(sample):
             print(f"  ...{i}/{len(sample)}", flush=True)
@@ -318,9 +410,14 @@ def main() -> int:
 
     L = []
     A = L.append
+    model_label = (
+        (Path(args.adapter).name if args.adapter else "基座")
+        if args.backend == "hf" else
+        f"qwen3vl-sft-Q4_K_M GGUF（llama-server {args.llama_url}）"
+    )
     A("# P7 · 端到端评测：最终答案质量")
     A("")
-    A(f"> 模型：`{Path(args.adapter).name if args.adapter else '基座'}` ｜ "
+    A(f"> 模型：`{model_label}` ｜ backend=**{args.backend}** ｜ "
       f"样本 **{len(sample)}** 条（按题型分层）｜ 判分口径 **v3**（与 P5/P5b 同一把尺子）")
     A("")
     A("## 1. 四组总览")
@@ -392,6 +489,32 @@ def main() -> int:
         extra = f"｜工具 {tool:.0f} ms（占 {tool / wall:.0%}）｜平均 {steps:.1f} 步" if g == "B" else ""
         A(f"- {NAME[g]}：平均 **{wall:.0f} ms**{extra}")
     A("")
+
+    # ---- 4b. llama-server 服务端计时（仅 llamacpp 后端；§5.9：延迟与吞吐成对、报 P50/P99）----
+    if gen_backend is not None:
+        A("## 4b. 服务端计时（llama-server，§5.9）")
+        A("")
+        A("> 口径说明：prefill_ms / decode per-token ms 取自 `/completion` 响应的 "
+          "`timings` 字段（服务端信源）；B 组一题多次请求，按**请求**粒度统计。"
+          "吞吐与 per-token 延迟互为倒数，成对给出。")
+        A("")
+        A("| 组 | 请求数 | prefill P50 | prefill P99 | per-token P50 | per-token P99 | 平均 decode |")
+        A("|---|---|---|---|---|---|---|")
+        for g in groups:
+            entries = [e for x in results[g] for e in x.get("perf", [])]
+            if not entries:
+                continue
+            pre = [e["prompt_ms"] for e in entries if e.get("prompt_ms") is not None]
+            ppt = [e["predicted_per_token_ms"] for e in entries
+                   if e.get("predicted_per_token_ms") is not None]
+            toks = sum(e.get("predicted_n") or 0 for e in entries)
+            dms = sum(e.get("predicted_ms") or 0.0 for e in entries)
+            tps = (toks / (dms / 1000.0)) if dms > 0 else None
+            A(f"| {NAME[g]} | {len(entries)} | "
+              f"{_pctile(pre, 50):.0f} ms | {_pctile(pre, 99):.0f} ms | "
+              f"{_pctile(ppt, 50):.1f} ms | {_pctile(ppt, 99):.1f} ms | "
+              f"{('%.1f tok/s' % tps) if tps else '—'} |")
+        A("")
     A("## 5. 分题型（B 组 vs A 组）")
     A("")
     if "A" in groups and "B" in groups:
@@ -420,13 +543,20 @@ def main() -> int:
 
     out_md = REPORT / f"P7_端到端评测_{args.tag}.md"
     out_md.write_text("\n".join(L), encoding="utf-8")
+    partial_fh.close()
+    progress_fh.close()
     print(f"\n[e2e] 报告 → {out_md}")
+    print(f"[e2e] 断点文件 {partial_path.name} 已完成使命，可删（重跑前删它=全新一轮）")
     for g in groups:
         print(f"[e2e] {NAME[g]}: score={agg_all[g]['score']:.3f} F1={agg_all[g]['F1']:.3f}")
+    if server_engine is not None:
+        server_engine.stop()
+        print("[e2e] llama-server 已关闭", flush=True)
     return 0
 
 
-def mk_row(r, q, pred, steps, tool_ms, wall_ms, all_ids, gold_ids, note="", trace=None):
+def mk_row(r, q, pred, steps, tool_ms, wall_ms, all_ids, gold_ids, note="", trace=None,
+           perf=None):
     cited = ID_RE.findall(pred or "")
     return {
         "id": r.get("id"), "task": r.get("task"), "question": q,
@@ -439,6 +569,8 @@ def mk_row(r, q, pred, steps, tool_ms, wall_ms, all_ids, gold_ids, note="", trac
         #    v2 没存它 → 只能看到最终答案，无法区分
         #    「工具算错了」还是「工具算对了但模型没用」。
         "trace": trace or [],
+        # llama-server 逐次服务端计时（prefill/decode 分段）；HF 后端为空列表
+        "perf": perf or [],
     }
 
 

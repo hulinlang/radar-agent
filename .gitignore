@@ -36,6 +36,9 @@ merged/
 *.bin
 *.pt
 *.pth
+
+# 第三方源码（llama.cpp 转换脚本/构建用浅克隆，P10）
+tools/
 *.ckpt
 *.onnx
 adapter_model.*

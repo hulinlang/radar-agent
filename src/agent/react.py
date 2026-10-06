@@ -104,11 +104,17 @@ def tool_call_bad_ids(tok) -> list[list[int]]:
 def react(question: str, *, model, tok, tools_spec: list[dict],
           bad_ids: list[list[int]] | None = None,
           cfg: dict[str, Any] | None = None,
-          execute=None) -> RunResult:
+          execute=None,
+          gen_backend=None) -> RunResult:
     """跑一轮 ReAct。
 
     execute: `(name, args) -> ToolResult`，默认用 `src.tools.registry.run`。
              注入式设计是为了让自测能塞假工具（不加载 GPU/索引）。
+    gen_backend: 可选的生成后端（P10-A4，llama-server 部署形态）。协议：
+             `backend(messages, tools_spec, max_new_tokens, is_last) -> (text, n_tokens)`。
+             传入后不再使用 model/tok（两者可传 None），末步屏蔽 <tool_call>
+             由后端负责（llama.cpp 侧为 logit_bias 等效实现，见
+             src/engines/react_llamacpp.py）；None 时走原 HF 路径，行为不变。
     """
     from ..tools.registry import run as _run
     exec_fn = execute or _run
@@ -139,26 +145,32 @@ def react(question: str, *, model, tok, tools_spec: list[dict],
             counters["max_steps_hit"] += 1
             msgs.append({"role": "user", "content": FORCE_FINAL})
 
-        prompt = tok.apply_chat_template(msgs, tools=tools_spec,
-                                         tokenize=False, add_generation_prompt=True)
-        ids = tok(prompt, return_tensors="pt").to(model.device)
-
         t0 = time.perf_counter()
-        gen_kw: dict[str, Any] = dict(
-            max_new_tokens=int(p["max_new_tokens_per_step"]), do_sample=False,
-            pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
-        # 末步：屏蔽 <tool_call>，逼它出最终答案
-        if is_last and bad_ids:
-            gen_kw["bad_words_ids"] = bad_ids
-        import torch
-        with torch.no_grad():
-            out = model.generate(**ids, **gen_kw)
+        if gen_backend is not None:
+            # llama-server 部署路径：渲染与生成都在后端内完成；
+            # 文本已按 <|im_end|> 截断（与下方 HF 路径的 cut 口径一致）
+            seg, n_new = gen_backend(msgs, tools_spec,
+                                     int(p["max_new_tokens_per_step"]), is_last)
+            gen = seg
+        else:
+            prompt = tok.apply_chat_template(msgs, tools=tools_spec,
+                                             tokenize=False, add_generation_prompt=True)
+            ids = tok(prompt, return_tensors="pt").to(model.device)
+            gen_kw: dict[str, Any] = dict(
+                max_new_tokens=int(p["max_new_tokens_per_step"]), do_sample=False,
+                pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id)
+            # 末步：屏蔽 <tool_call>，逼它出最终答案
+            if is_last and bad_ids:
+                gen_kw["bad_words_ids"] = bad_ids
+            import torch
+            with torch.no_grad():
+                out = model.generate(**ids, **gen_kw)
+            gen = tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=False)
+            cut = gen.find("<|im_end|>")
+            seg = gen[:cut] if cut >= 0 else gen
+            n_new = len(out[0]) - ids["input_ids"].shape[1]
         t_gen = (time.perf_counter() - t0) * 1000.0
-
-        gen = tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=False)
-        cut = gen.find("<|im_end|>")
-        seg = gen[:cut] if cut >= 0 else gen
-        total_tokens += len(out[0]) - ids["input_ids"].shape[1]
+        total_tokens += n_new
 
         # ---- 解析（第0~3门）----
         t1 = time.perf_counter()

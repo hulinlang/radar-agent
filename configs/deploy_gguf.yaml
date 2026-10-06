@@ -1,0 +1,37 @@
+# =============================================================================
+# P10 部署配置：微调版 GGUF × llama-server
+#
+# 与 configs/engines/llamacpp.yaml 的区别：
+#   那份是 P1 引擎选型基准（基座 Q4_K_M）；这份是**部署形态**（p5b_tool6 微调版）。
+#   结构刻意与 LlamaCppEngine 的配置协议一致，p10_serve_gguf.py 直接复用其
+#   生命周期管理（进程拉起 / 就绪探针 / 设备断言），不重写。
+#
+# ⚠️ server.device 仅对 **Windows Vulkan 构建** 有意义；
+#    切到 WSL2 CUDA 构建后没有 --device 概念（只有 CUDA0），届时由
+#    scripts/p10_serve_gguf.py 的 --external-url 模式直连已起好的 WSL 服务。
+# =============================================================================
+
+engine:
+  name: llamacpp
+  display: "llama.cpp SFT Q4_K_M (llama-server)"
+
+binary:
+  # winget 包目录（glob 容忍构建号变化）；WSL 部署时此项不适用（--external-url）
+  bin_dir: "%LOCALAPPDATA%/Microsoft/WinGet/Packages/ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe"
+
+model:
+  # P10-A2 产物：p5b_tool6 微调版（merge → F16 → Q4_K_M）
+  llm_path:    "${paths.models_gguf}/qwen3vl-sft-Q4_K_M.gguf"
+  # 视觉塔微调全程冻结 → mmproj 直接复用基座（docs/17 §3.1）
+  mmproj_path: "${paths.models_gguf}/mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  startup_timeout_s: 300
+  # 实测本机 Vulkan0=RTX 4060 / Vulkan1=AMD 核显；不显式指定会静默落到核显上
+  device: "Vulkan0"
+  n_gpu_layers: 99
+  ctx_size: 8192
+  parallel: 1
+  flash_attn: true
