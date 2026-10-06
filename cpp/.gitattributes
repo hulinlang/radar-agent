@@ -1,0 +1,2 @@
+# C++ 引擎与脚本一律 LF（WSL2 bash/gcc 不认 CRLF）
+* text=auto eol=lf
