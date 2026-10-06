@@ -9,6 +9,7 @@
 #include "gguf.h"
 #include "ops.h"
 #include "quants.h"
+#include "simd_avx2.h"
 
 #ifdef USE_OPENBLAS
 #include <cblas.h>
@@ -87,9 +88,9 @@ void matvec_any(Model::W w, const float* x, float* y, int in, int out) {
                         reinterpret_cast<const float*>(w.p), in, x, 1, 0.0f, y, 1);
             return;
 #endif
-        case 1:  matvec_f16(reinterpret_cast<const uint16_t*>(w.p), x, y, in, out); return;
-        case 12: matvec_q4_k(w.p, x, y, in, out); return;
-        case 14: matvec_q6_k(w.p, x, y, in, out); return;
+        case 1:  matvec_f16_avx2(reinterpret_cast<const uint16_t*>(w.p), x, y, in, out); return;
+        case 12: matvec_q4_k_avx2(w.p, x, y, in, out); return;
+        case 14: matvec_q6_k_avx2(w.p, x, y, in, out); return;
         default: fail("unsupported weight type");
     }
 }

@@ -18,7 +18,7 @@ endif()
 find_package(OpenMP)
 
 # B4：端到端 CLI（分词 + 前向 + greedy 生成）
-add_executable(radar-infer src/gguf.cpp src/tokenizer.cpp src/ops.cpp src/quants.cpp src/model.cpp src/main.cpp)
+add_executable(radar-infer src/gguf.cpp src/tokenizer.cpp src/ops.cpp src/quants.cpp src/simd_avx2.cpp src/model.cpp src/main.cpp)
 
 # B1：GGUF 加载器 + 规范化 dump 工具
 add_executable(gguf-dump src/gguf.cpp src/gguf_dump.cpp)
@@ -27,7 +27,7 @@ add_executable(gguf-dump src/gguf.cpp src/gguf_dump.cpp)
 add_executable(tokenizer-test src/gguf.cpp src/tokenizer.cpp src/tokenizer_test.cpp)
 
 # B3：CPU 前向（语义基准）+ 逐层对拍
-add_executable(forward-test src/gguf.cpp src/ops.cpp src/quants.cpp src/model.cpp src/forward_test.cpp)
+add_executable(forward-test src/gguf.cpp src/ops.cpp src/quants.cpp src/simd_avx2.cpp src/model.cpp src/forward_test.cpp)
 
 # B5：OpenMP 多线程（行分区并行，逐 bit 不变）
 if(OpenMP_CXX_FOUND)
