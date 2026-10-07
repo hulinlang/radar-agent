@@ -226,6 +226,26 @@ __global__ void gemv_f16(const __half* w, const float* x, float* y, int in, int 
     if (threadIdx.x == 0) y[row] = smem[0];
 }
 
+// v2: one warp per row, half2 vectorized loads (full 128B cacheline per warp
+// transaction), warp-shuffle reduction (no shared memory chain).
+__global__ void gemv_f16_v2(const __half* w, const float* x, float* y, int in, int out) {
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * (blockDim.x / 32) + warp;
+    if (row >= out) return;
+    const __half2* wr = reinterpret_cast<const __half2*>(w + static_cast<size_t>(row) * in);
+    const float2* x2 = reinterpret_cast<const float2*>(x);
+    float acc = 0.0f;
+    const int n2 = in / 2;
+    for (int i = lane; i < n2; i += 32) {
+        const float2 wv = __half22float2(wr[i]);
+        const float2 xv = x2[i];
+        acc += wv.x * xv.x + wv.y * xv.y;
+    }
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
+
 // ---------------- impl ----------------
 
 struct LayerDev {
@@ -260,14 +280,66 @@ struct GpuModel::Impl {
         free_if(d_x); free_if(d_h); free_if(d_q); free_if(d_k); free_if(d_v);
         free_if(d_att); free_if(d_scores); free_if(d_gate); free_if(d_up);
         free_if(d_ffn); free_if(d_logits);
+        prof_print();
+        prof_destroy();
         if (h_logits) cudaFreeHost(h_logits);
     }
 
     // y[out] = W_rm[out][in] · x[in]; custom decode gemv (F16 weights, F32
     // activations and accumulation — numerics match the CPU reference).
     void gemv(const __half* w, const float* x, float* y, int in, int out) {
-        gemv_f16<<<out, 256>>>(w, x, y, in, out);
+        gemv_f16_v2<<<(out + 3) / 4, 128>>>(w, x, y, in, out);
     }
+
+    // ---- profiling (RADAR_GPU_PROFILE=1): per-phase CUDA event timing ----
+    bool prof = false;
+    static constexpr int PH_GEMV = 0, PH_ATTN = 1, PH_LOGITS = 2, PH_D2H = 3, PH_TOTAL = 4, NPH = 5;
+    double acc_ms[NPH] = {0};
+    int64_t acc_n = 0;
+    cudaEvent_t ev[512];
+    int ev_phase[512];
+    int nev = 0;
+    void prof_init() {
+        prof = std::getenv("RADAR_GPU_PROFILE") != nullptr;
+        if (prof) for (int i = 0; i < 512; ++i) CU_CHECK(cudaEventCreate(&ev[i]));
+    }
+    void prof_begin(int phase) {
+        if (!prof) return;
+        ev_phase[nev] = phase;
+        CU_CHECK(cudaEventRecord(ev[nev++]));
+    }
+    void prof_end(int phase) {
+        if (!prof) return;
+        ev_phase[nev] = ~phase;
+        CU_CHECK(cudaEventRecord(ev[nev++]));
+    }
+    void prof_collect() {
+        if (!prof) return;
+        CU_CHECK(cudaDeviceSynchronize());
+        int open[NPH] = {-1, -1, -1, -1, -1};
+        for (int i = 0; i < nev; ++i) {
+            const int ph = ev_phase[i];
+            if (ph >= 0) open[ph] = i;
+            else {
+                const int p = ~ph;
+                float ms = 0;
+                CU_CHECK(cudaEventElapsedTime(&ms, ev[open[p]], ev[i]));
+                acc_ms[p] += ms;
+            }
+        }
+        nev = 0;
+        ++acc_n;
+    }
+    void prof_print() {
+        if (!prof || acc_n == 0) return;
+        const char* names[NPH] = {"gemv(weights)", "attention", "logits gemv", "logits D2H+argmax", "total"};
+        std::fprintf(stderr, "== GPU profile (%lld tokens, ms/token) ==\n", (long long)acc_n);
+        for (int i = 0; i < NPH; ++i) {
+            std::fprintf(stderr, "  %-18s %7.3f ms (%5.1f%%)\n", names[i], acc_ms[i] / acc_n,
+                         100.0 * acc_ms[i] / (acc_ms[PH_TOTAL] > 0 ? acc_ms[PH_TOTAL] : 1));
+        }
+    }
+    void prof_destroy() { if (prof) for (int i = 0; i < 512; ++i) cudaEventDestroy(ev[i]); }
 };
 
 GpuModel::GpuModel(GpuModel&& o) noexcept : impl_(o.impl_) { o.impl_ = nullptr; }
@@ -334,6 +406,7 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap) {
     CU_CHECK(cudaMalloc(&m->d_logits, c.vocab * 4));
     CU_CHECK(cudaMallocHost(&m->h_logits, c.vocab * 4));
     CU_CHECK(cudaDeviceSynchronize());
+    m->prof_init();
     return gm;
 }
 
@@ -348,6 +421,7 @@ int32_t GpuModel::forward_argmax(int32_t token, int pos) {
     const size_t layer_v_stride = layer_k_stride;
     const size_t head_stride = static_cast<size_t>(m->kv_cap) * c.head_dim;
 
+    m->prof_begin(Impl::PH_TOTAL);
     embed_row<<<(H + 255) / 256, 256>>>(m->d_embd, m->d_x, token, H);
 
     for (int l = 0; l < c.n_layer; ++l) {
@@ -356,33 +430,39 @@ int32_t GpuModel::forward_argmax(int32_t token, int pos) {
         const size_t lv = lk + layer_v_stride;
 
         rmsnorm<<<1, 256>>>(m->d_x, w.attn_norm, m->d_h, H, c.rms_eps);
-        m->gemv(w.wq, m->d_h, m->d_q, H, Q);
-        m->gemv(w.wk, m->d_h, m->d_k, H, KV);
-        m->gemv(w.wv, m->d_h, m->d_v, H, KV);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wq, m->d_h, m->d_q, H, Q); m->prof_end(Impl::PH_GEMV);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wk, m->d_h, m->d_k, H, KV); m->prof_end(Impl::PH_GEMV);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wv, m->d_h, m->d_v, H, KV); m->prof_end(Impl::PH_GEMV);
         rmsnorm_heads<<<c.n_head, 128>>>(m->d_q, w.q_norm, c.head_dim, c.rms_eps);
         rmsnorm_heads<<<c.n_kv_head, 128>>>(m->d_k, w.k_norm, c.head_dim, c.rms_eps);
         rope_qk<<<c.n_head + c.n_kv_head, c.head_dim / 2>>>(m->d_q, m->d_k, c.n_head,
                                                             c.head_dim, pos, c.rope_theta);
         kv_store<<<(KV + 255) / 256, 256>>>(m->d_k, m->d_v, m->d_kv, lk, lv,
                                             head_stride, c.n_kv_head, c.head_dim, pos);
+        m->prof_begin(Impl::PH_ATTN);
         attention<<<c.n_head, 128>>>(m->d_q, m->d_kv, m->d_att, m->d_scores, lk, lv,
                                      head_stride, c.n_head, c.n_kv_head, c.head_dim, pos, scale);
-        m->gemv(w.wo, m->d_att, m->d_ffn, Q, H);
+        m->prof_end(Impl::PH_ATTN);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wo, m->d_att, m->d_ffn, Q, H); m->prof_end(Impl::PH_GEMV);
         add_inplace<<<(H + 255) / 256, 256>>>(m->d_x, m->d_ffn, H);
         rmsnorm<<<1, 256>>>(m->d_x, w.ffn_norm, m->d_h, H, c.rms_eps);
-        m->gemv(w.wg, m->d_h, m->d_gate, H, c.ffn);
-        m->gemv(w.wu, m->d_h, m->d_up, H, c.ffn);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wg, m->d_h, m->d_gate, H, c.ffn); m->prof_end(Impl::PH_GEMV);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wu, m->d_h, m->d_up, H, c.ffn); m->prof_end(Impl::PH_GEMV);
         silu_up<<<(c.ffn + 255) / 256, 256>>>(m->d_gate, m->d_up, c.ffn);
-        m->gemv(w.wd, m->d_gate, m->d_ffn, c.ffn, H);
+        m->prof_begin(Impl::PH_GEMV); m->gemv(w.wd, m->d_gate, m->d_ffn, c.ffn, H); m->prof_end(Impl::PH_GEMV);
         add_inplace<<<(H + 255) / 256, 256>>>(m->d_x, m->d_ffn, H);
     }
 
     rmsnorm<<<1, 256>>>(m->d_x, m->d_out_norm, m->d_h, H, c.rms_eps);
-    m->gemv(m->d_embd, m->d_h, m->d_logits, H, c.vocab);
+    m->prof_begin(Impl::PH_LOGITS); m->gemv(m->d_embd, m->d_h, m->d_logits, H, c.vocab); m->prof_end(Impl::PH_LOGITS);
+    m->prof_begin(Impl::PH_D2H);
     CU_CHECK(cudaMemcpy(m->h_logits, m->d_logits, c.vocab * sizeof(float), cudaMemcpyDeviceToHost));
 
     int32_t best = 0;
     for (int i = 1; i < c.vocab; ++i) if (m->h_logits[i] > m->h_logits[best]) best = i;
+    m->prof_end(Impl::PH_D2H);
+    m->prof_end(Impl::PH_TOTAL);
+    m->prof_collect();
     return best;
 }
 

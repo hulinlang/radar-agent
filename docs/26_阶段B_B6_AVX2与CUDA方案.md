@@ -121,3 +121,40 @@ gemv 未做 half2 向量化加载——方向明确，属优化项非语义差�
 
 AVX2 数值进入前向后复跑：B1 9/9、B2 3/3、B3 2/2 全绿（B3 logits max_abs 2.8e-5，
 较标量路径的 5.3e-5 更小——8 路部分和更准）。
+
+---
+
+## B6b 差距分析与 gemv v2（2026-10-07，profile 驱动优化）
+
+### 分段计时（CUDA events，RADAR_GPU_PROFILE=1，105 token 均值，v1）
+
+| 阶段 | ms/token | 占比 |
+|---|---|---|
+| 权重 gemv（28 层 × 7） | 19.15 | 76.8% |
+| logits gemv（2048×151936） | 3.74 | 15.0% |
+| attention | 0.41 | 1.7% |
+| logits D2H + host argmax | 0.36 | 1.4% |
+| 其余（小 kernel + launch 开销） | 1.27 | 5.1% |
+
+### 带宽账（实测，WSL2）
+
+- **WSL2 D2D 实测带宽 217.4 GB/s**（1GiB 拷贝 ×20，bw_probe.cu）——规格 272 是理论值，
+  217 就是真实天花板；**WSL2 对 GPU 带宽基本无损**（Windows 预留 ~700MB 是显存**容量**，
+  与 decode 速度无关；且两引擎同环境，对照公平）。
+- v1 层 gemv 效率：2.82GB / 19.15ms = **147 GB/s（天花板的 68%）**；
+  logits gemv 166 GB/s（77%）——同 kernel 同带宽、效率不同 → 锁定 kernel 内部问题。
+- 根因：v1 标量 2 字节加载，warp 每指令只利用 64/128 字节 cacheline（sector 效率减半）。
+
+### gemv v2：half2 向量化 + warp shuffle 归约（无 shared memory 链）
+
+| 指标 | v1 | v2 |
+|---|---|---|
+| decode tok/s（100 token 中位） | 40.36 | **62.52** |
+| 层 gemv ms/token | 19.15 | 15.92 |
+| 等效带宽 | 139 GB/s | **215 GB/s ≈ 实测天花板** |
+| 对拍 llama.cpp CUDA F16 | 4/5 全等 + 平局个案 | **5/5 全等**（p5 平局随累加顺序变化自然翻转回一致） |
+| vs llama.cpp（同 session 60.84） | 82% | **103%** |
+
+**结论：两者都已在访存屋顶线上（~215/217 GB/s），差距闭合。**
+剩余理论余量：CUDA Graphs 消 launch 开销（~5%）、Q4-on-GPU（字节 ÷3.3，
+带宽口径上限 ~200 tok/s；llama.cpp 实测 118.6 作参照）。
