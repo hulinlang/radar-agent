@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
     std::string model_path, prompt, ids_out, teacher_path, backend = "omp";
     int n_predict = 100;
     int kv_cap = 0;
+    bool batch_prefill = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* name) -> std::string {
@@ -110,6 +111,7 @@ int main(int argc, char** argv) {
         else if (a == "--ids-out") ids_out = need("--ids-out");
         else if (a == "--teacher-file") teacher_path = need("--teacher-file");
         else if (a == "--backend") backend = need("--backend");
+        else if (a == "--no-batch-prefill") batch_prefill = false;
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty() || prompt.empty()) {
@@ -135,7 +137,15 @@ int main(int argc, char** argv) {
             ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap);
             const auto t0 = Clock::now();
             int32_t next = 0;
-            for (size_t i = 0; i < ids.size(); ++i) next = gpu.forward_argmax(ids[i], static_cast<int>(i));
+            if (batch_prefill) {
+                // B8a: weights are read once per 16-token chunk instead of
+                // once per token; bitwise-identical KV/logits state.
+                std::vector<float> logits(gpu.config().vocab);
+                gpu.prefill_batch(ids.data(), static_cast<int>(ids.size()), logits.data());
+                next = argmax(logits);
+            } else {
+                for (size_t i = 0; i < ids.size(); ++i) next = gpu.forward_argmax(ids[i], static_cast<int>(i));
+            }
             const auto t1 = Clock::now();
 
             if (!teacher_path.empty()) {

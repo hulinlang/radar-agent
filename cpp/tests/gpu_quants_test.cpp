@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
@@ -118,6 +119,58 @@ int check_gemv(const ri::GGUFFile& f, const char* name) {
     return ok ? 0 : 1;
 }
 
+// B8: multi-column gemv must be bitwise-identical per column to single runs.
+int check_gemv_mc(const ri::GGUFFile& f, const char* name, int ncol) {
+    const ri::TensorInfo* t = f.tensor(name);
+    if (!t) { std::fprintf(stderr, "tensor %s missing\n", name); return 1; }
+    const int in = static_cast<int>(t->dims[0]);
+    const int out = static_cast<int>(t->dims[1]);
+    const uint8_t* raw = static_cast<const uint8_t*>(f.tensor_data(*t));
+
+    std::vector<float> x(static_cast<size_t>(ncol) * in);
+    for (int c = 0; c < ncol; ++c)
+        for (int i = 0; i < in; ++i)
+            x[static_cast<size_t>(c) * in + i] =
+                sinf(i * 0.017f + c * 0.73f) * 0.8f + cosf(i * 0.043f) * 0.2f;
+
+    uint8_t* dw = nullptr;
+    float *dx = nullptr, *dy = nullptr, *dy1 = nullptr;
+    CU_CHECK(cudaMalloc(&dw, t->n_bytes));
+    CU_CHECK(cudaMalloc(&dx, x.size() * sizeof(float)));
+    CU_CHECK(cudaMalloc(&dy, static_cast<size_t>(ncol) * out * sizeof(float)));
+    CU_CHECK(cudaMalloc(&dy1, out * sizeof(float)));
+    CU_CHECK(cudaMemcpy(dw, raw, t->n_bytes, cudaMemcpyHostToDevice));
+    CU_CHECK(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+    if (t->ggml_type == 12) ri::gpuq::gemv_q4k_mc(dw, dx, dy, in, out, ncol);
+    else ri::gpuq::gemv_q6k_mc(dw, dx, dy, in, out, ncol);
+    std::vector<float> mc(static_cast<size_t>(ncol) * out);
+    CU_CHECK(cudaMemcpy(mc.data(), dy, mc.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+    int fails = 0;
+    for (int c = 0; c < ncol; ++c) {
+        if (t->ggml_type == 12)
+            ri::gpuq::gemv_q4k(dw, dx + static_cast<size_t>(c) * in, dy1, in, out);
+        else
+            ri::gpuq::gemv_q6k(dw, dx + static_cast<size_t>(c) * in, dy1, in, out);
+        std::vector<float> ref(out);
+        CU_CHECK(cudaMemcpy(ref.data(), dy1, out * sizeof(float), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < out; ++i) {
+            if (std::memcmp(&mc[static_cast<size_t>(c) * out + i], &ref[i], 4) != 0) {
+                ++fails;
+                break;
+            }
+        }
+    }
+    cudaFree(dw);
+    cudaFree(dx);
+    cudaFree(dy);
+    cudaFree(dy1);
+    const bool ok = fails == 0;
+    std::printf("gemv-mc %-22s type=%u %dx%d ncol=%d %s\n", name, t->ggml_type, in, out,
+                ncol, ok ? "BITWISE-PARITY" : "MISMATCH");
+    return ok ? 0 : 1;
+}
+
 int check_embed(const ri::GGUFFile& f, int token) {
     const ri::TensorInfo* t = f.tensor("token_embd.weight");
     if (!t || t->ggml_type != 14) {
@@ -174,6 +227,9 @@ int main(int argc, char** argv) {
         fails += check_gemv(f, "blk.0.attn_v.weight");
         fails += check_gemv(f, "blk.27.ffn_down.weight");
         fails += check_embed(f, 12345);
+        fails += check_gemv_mc(f, "blk.0.attn_q.weight", 8);   // Q4_K
+        fails += check_gemv_mc(f, "blk.10.ffn_up.weight", 16);  // Q4_K, wide
+        fails += check_gemv_mc(f, "blk.0.attn_v.weight", 8);   // Q6_K
         std::printf("GPU-QUANTS: %s\n", fails == 0 ? "all pass" : "FAILURES");
         return fails == 0 ? 0 : 1;
     } catch (const std::exception& e) {

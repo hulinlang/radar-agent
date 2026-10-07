@@ -13,6 +13,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "gpu_quants.cuh"
+
 namespace ri {
 namespace gpuq {
 namespace {
@@ -21,49 +23,8 @@ constexpr int QK_K = 256;
 constexpr int Q4K_BLOCK_BYTES = 144;
 constexpr int Q6K_BLOCK_BYTES = 210;
 
-// ggml get_scale_min_k4: 8 sub-block scales and mins, 6-bit each, split-packed
-// into 12 bytes.
-__device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q,
-                                                 uint8_t* d, uint8_t* m) {
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-    }
-}
-
-// Dequantized value i (0..255) of one Q4_K super-block. Same scalar op order
-// as dequantize_row_q4_K.
-__device__ __forceinline__ float q4k_at(const uint8_t* sb, int i) {
-    const float d = __half2float(*reinterpret_cast<const __half*>(sb));
-    const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
-    const int j = i >> 5;           // sub-block
-    const int l = i & 31;
-    uint8_t sc, m;
-    get_scale_min_k4(j, sb + 4, &sc, &m);
-    const uint8_t byte = sb[16 + (j >> 1) * 32 + l];
-    const int nib = (j & 1) ? (byte >> 4) : (byte & 0xF);
-    return d * sc * nib - dmin * m;
-}
-
-// Dequantized value i (0..255) of one Q6_K super-block. Same scalar op order
-// as dequantize_row_q6_K.
-__device__ __forceinline__ float q6k_at(const uint8_t* sb, int i) {
-    const int nn = i >> 7;          // 128-value half
-    const int r = i & 127;
-    const int qq = r >> 5;          // strided group within the half
-    const int l = r & 31;
-    const uint8_t* ql = sb + nn * 64;
-    const uint8_t* qh = sb + 128 + nn * 32;
-    const int8_t* sc = reinterpret_cast<const int8_t*>(sb + 192) + nn * 8;
-    const float d = __half2float(*reinterpret_cast<const __half*>(sb + 208));
-    const uint8_t b = ql[l + (qq & 1) * 32];
-    const int nib = (qq < 2) ? (b & 0xF) : (b >> 4);
-    const int q = (nib | (((qh[l] >> (2 * qq)) & 3) << 4)) - 32;
-    return d * sc[l / 16 + 2 * qq] * q;
-}
+using detail::q4k_at;
+using detail::q6k_at;
 
 // ---------------- whole-tensor dequant (unit test) ----------------
 
@@ -84,6 +45,11 @@ __global__ void dequant_q6k_kernel(const uint8_t* w, float* y, int64_t n) {
 }
 
 // ---------------- fused dequant-dot gemv ----------------
+
+// defined below in the multi-column section (shared by single- and
+// multi-column Q4_K kernels)
+__device__ __forceinline__ void q4k_row_scales(const uint8_t* wr, int nb, int lane,
+                                               float2* pm);
 
 // Q4_K v7: warp per row. Per-row prologue: the warp cooperatively decodes ALL
 // (d*sc, dmin*m) pairs into shared memory (nb*8 pairs, ≤ 24 sb x 8 = 192 per
@@ -107,29 +73,7 @@ __global__ void gemv_q4k_kernel(const uint8_t* w, const float* x, float* y,
     const uint8_t* wr = w + static_cast<size_t>(row) * (in / QK_K) * Q4K_BLOCK_BYTES;
     const int nb = in / QK_K;
     float2* pm = sdmsc[warp];
-
-    for (int idx = lane; idx < nb * 8; idx += 32) {
-        const uint8_t* sb = wr + (idx >> 3) * Q4K_BLOCK_BYTES;
-        const int j = idx & 7;
-        const float d = __half2float(*reinterpret_cast<const __half*>(sb));
-        const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
-        const uint32_t s0 = *reinterpret_cast<const uint32_t*>(sb + 4);
-        const uint32_t s1 = *reinterpret_cast<const uint32_t*>(sb + 8);
-        const uint32_t s2 = *reinterpret_cast<const uint32_t*>(sb + 12);
-        uint32_t sc, mn;
-        if (j < 4) {
-            sc = (s0 >> (8 * j)) & 63;
-            mn = (s1 >> (8 * j)) & 63;
-        } else {
-            const uint32_t lo = (s0 >> (8 * (j - 4))) & 0xFF;   // scales[j-4]
-            const uint32_t mid = (s1 >> (8 * (j - 4))) & 0xFF;  // scales[j]
-            const uint32_t hi = (s2 >> (8 * (j - 4))) & 0xFF;   // scales[j+4]
-            sc = (hi & 0xF) | ((lo >> 6) << 4);
-            mn = (hi >> 4) | ((mid >> 6) << 4);
-        }
-        pm[idx] = make_float2(d * sc, dmin * mn);
-    }
-    __syncwarp();
+    q4k_row_scales(wr, nb, lane, pm);
 
     float acc = 0.0f;
     for (int b = 0; b < nb; ++b) {
@@ -183,6 +127,160 @@ __global__ void gemv_q6k_kernel(const uint8_t* w, const float* x, float* y,
     if (lane == 0) y[row] = acc;
 }
 
+// ---------------- B8 multi-column gemv (weights read once for NC columns) ----------------
+
+// shared prologue: decode the row's (d*sc, dmin*m) pairs into smem pm[nb*8].
+__device__ __forceinline__ void q4k_row_scales(const uint8_t* wr, int nb, int lane,
+                                               float2* pm) {
+    for (int idx = lane; idx < nb * 8; idx += 32) {
+        const uint8_t* sb = wr + (idx >> 3) * Q4K_BLOCK_BYTES;
+        const int j = idx & 7;
+        const float d = __half2float(*reinterpret_cast<const __half*>(sb));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
+        const uint32_t s0 = *reinterpret_cast<const uint32_t*>(sb + 4);
+        const uint32_t s1 = *reinterpret_cast<const uint32_t*>(sb + 8);
+        const uint32_t s2 = *reinterpret_cast<const uint32_t*>(sb + 12);
+        uint32_t sc, mn;
+        if (j < 4) {
+            sc = (s0 >> (8 * j)) & 63;
+            mn = (s1 >> (8 * j)) & 63;
+        } else {
+            const uint32_t lo = (s0 >> (8 * (j - 4))) & 0xFF;   // scales[j-4]
+            const uint32_t mid = (s1 >> (8 * (j - 4))) & 0xFF;  // scales[j]
+            const uint32_t hi = (s2 >> (8 * (j - 4))) & 0xFF;   // scales[j+4]
+            sc = (hi & 0xF) | ((lo >> 6) << 4);
+            mn = (hi >> 4) | ((mid >> 6) << 4);
+        }
+        pm[idx] = make_float2(d * sc, dmin * mn);
+    }
+    __syncwarp();
+}
+
+// Multi-column Q4_K: warp per R consecutive rows, NC activation columns.
+// Per value the dequantized wv is computed once (same expression and rounding
+// as the single kernel) and FMA'd into acc[r][c]; x is loaded once per
+// (column, m) and reused across the R rows — that reuse is what keeps the
+// kernel DRAM-bound: R=1 collapses L1 under NC x 1KB of x traffic per 144B
+// super-block (B8 bench: ncol=16 R=1 -> 19 GB/s; the x side, not the weights).
+// Each column/row's accumulation order is unchanged -> bitwise parity.
+template <int R, int NC>
+__global__ void gemv_q4k_mc_kernel(const uint8_t* w, const float* x, float* y,
+                                   int in, int out) {
+    constexpr int MAX_NB = 24;  // in <= 6144
+    __shared__ float2 sdmsc[4][R][MAX_NB * 8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row0 = (blockIdx.x * 4 + warp) * R;
+    if (row0 >= out) return;
+    const size_t row_bytes = static_cast<size_t>(in / QK_K) * Q4K_BLOCK_BYTES;
+    const int nb = in / QK_K;
+    float2* pm = &sdmsc[warp][0][0];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        if (row0 + r < out) q4k_row_scales(w + (row0 + r) * row_bytes, nb, lane, pm + r * MAX_NB * 8);
+
+    float acc[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+
+    for (int b = 0; b < nb; ++b) {
+        uint8_t qs[R][4];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r >= out) break;
+            const uint8_t* sb = w + (row0 + r) * row_bytes + b * Q4K_BLOCK_BYTES;
+            qs[r][0] = sb[16 + lane];
+            qs[r][1] = sb[48 + lane];
+            qs[r][2] = sb[80 + lane];
+            qs[r][3] = sb[112 + lane];
+        }
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            float wv[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float2 dmsc = pm[r * MAX_NB * 8 + b * 8 + m];
+                const uint32_t nib = (qs[r][m >> 1] >> ((m & 1) * 4)) & 0xF;
+                wv[r] = dmsc.x * nib - dmsc.y;
+            }
+            const int off = b * QK_K + 32 * m + lane;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const float xv = x[static_cast<size_t>(c) * in + off];
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r][c] += wv[r] * xv;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= out) break;
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float a = acc[r][c];
+            for (int off = 16; off; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) y[static_cast<size_t>(c) * out + row0 + r] = a;
+        }
+    }
+}
+
+// Multi-column Q6_K: same R-rows-per-warp x-reuse structure as Q4_K mc.
+template <int R, int NC>
+__global__ void gemv_q6k_mc_kernel(const uint8_t* w, const float* x, float* y,
+                                   int in, int out) {
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
+    if (row0 >= out) return;
+    const size_t row_bytes = static_cast<size_t>(in / QK_K) * Q6K_BLOCK_BYTES;
+    const int nb = in / QK_K;
+
+    float acc[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        for (int nn = 0; nn < 2; ++nn) {
+#pragma unroll
+            for (int qq = 0; qq < 4; ++qq) {
+                float wv[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (row0 + r >= out) { wv[r] = 0.0f; continue; }
+                    const uint8_t* sb = w + (row0 + r) * row_bytes + b * Q6K_BLOCK_BYTES;
+                    const float d = __half2float(*reinterpret_cast<const __half*>(sb + 208));
+                    const uint8_t* ql = sb + nn * 64;
+                    const uint8_t* qh = sb + 128 + nn * 32;
+                    const int8_t* sc = reinterpret_cast<const int8_t*>(sb + 192) + nn * 8;
+                    const uint32_t b8 = (qq & 1) ? ql[lane + 32] : ql[lane];
+                    const int nib = (qq < 2) ? (b8 & 0xF) : (b8 >> 4);
+                    const int q = (nib | (((qh[lane] >> (2 * qq)) & 3) << 4)) - 32;
+                    wv[r] = d * sc[lane / 16 + 2 * qq] * q;
+                }
+                const int off = b * QK_K + nn * 128 + qq * 32 + lane;
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    const float xv = x[static_cast<size_t>(c) * in + off];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) acc[r][c] += wv[r] * xv;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= out) break;
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float a = acc[r][c];
+            for (int off = 16; off; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) y[static_cast<size_t>(c) * out + row0 + r] = a;
+        }
+    }
+}
+
 __global__ void embed_row_q6k_kernel(const uint8_t* embd, float* x,
                                      const int* token_p, int hidden) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -202,6 +300,27 @@ void gemv_q4k(const uint8_t* w, const float* x, float* y, int in, int out,
 void gemv_q6k(const uint8_t* w, const float* x, float* y, int in, int out,
               cudaStream_t stream) {
     gemv_q6k_kernel<<<(out + 3) / 4, 128, 0, stream>>>(w, x, y, in, out);
+}
+
+void gemv_q4k_mc(const uint8_t* w, const float* x, float* y, int in, int out,
+                 int ncol, cudaStream_t stream) {
+    if (ncol <= 1) { gemv_q4k(w, x, y, in, out, stream); return; }
+    // 4 warps per block, R rows per warp
+    auto grid_for = [out](int r) { return ((out + r - 1) / r + 3) / 4; };
+    if (ncol <= 2) gemv_q4k_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else if (ncol <= 4) gemv_q4k_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else if (ncol <= 8) gemv_q4k_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else gemv_q4k_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, x, y, in, out);
+}
+
+void gemv_q6k_mc(const uint8_t* w, const float* x, float* y, int in, int out,
+                 int ncol, cudaStream_t stream) {
+    if (ncol <= 1) { gemv_q6k(w, x, y, in, out, stream); return; }
+    auto grid_for = [out](int r) { return ((out + r - 1) / r + 3) / 4; };
+    if (ncol <= 2) gemv_q6k_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else if (ncol <= 4) gemv_q6k_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else if (ncol <= 8) gemv_q6k_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else gemv_q6k_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, x, y, in, out);
 }
 
 void embed_row_q6k(const uint8_t* embd, float* x, const int* token_p, int hidden,

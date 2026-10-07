@@ -16,6 +16,7 @@
 
 #include "gguf.h"
 #include "gpu_quants.h"
+#include "gpu_quants.cuh"  // gpuq::detail::q6k_at for embed_rows_q6k
 #include "model.h"  // ModelConfig
 
 namespace ri {
@@ -160,13 +161,17 @@ __global__ void kv_store(const float* k, const float* v, float* kv,
     kv[layer_v_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = v[i];
 }
 
-// decode attention: one block per q head; pos from device memory (graph-safe)
+// decode attention: one block per q head; pos from device memory (graph-safe).
+// scores is PER-HEAD scratch (stride scores_stride) — sharing one buffer
+// across head blocks is a latent data race (fixed in B8; long prompts
+// corrupted the softmax and produced NaN -> argmax 0 loops).
 __global__ void attention(const float* q, const float* kv, float* att, float* scores,
                           size_t layer_k_stride, size_t layer_v_stride, size_t head_stride,
                           int n_head, int n_kv_head, int head_dim, const int* pos_p,
-                          float scale) {
+                          float scale, int scores_stride) {
     const int pos = *pos_p;
     const int qh = blockIdx.x;
+    scores += static_cast<size_t>(qh) * scores_stride;
     const int kvh = qh / (n_head / n_kv_head);
     const float* q_h = q + qh * head_dim;
     const float* k_base = kv + layer_k_stride + kvh * head_stride;
@@ -226,6 +231,188 @@ __global__ void add_inplace(float* x, const float* y, int n) {
     if (i < n) x[i] += y[i];
 }
 
+// ---------------- B8a batch-prefill kernels ----------------
+// Row r of a chunk is sequence position pos_base + r. Every kernel's per-row
+// math (loop order, reduction tree, block size) is identical to the
+// single-token kernel it replaces, so batch prefill is bitwise-equivalent to
+// n sequential single-token steps.
+
+__global__ void embed_rows_f16(const __half* embd, float* x, const int* tokens,
+                               int hidden) {
+    const int tok = tokens[blockIdx.x];
+    float* xr = x + static_cast<size_t>(blockIdx.x) * hidden;
+    const __half* er = embd + static_cast<size_t>(tok) * hidden;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) xr[i] = __half2float(er[i]);
+}
+
+__global__ void embed_rows_q6k(const uint8_t* embd, float* x, const int* tokens,
+                               int hidden) {
+    const int tok = tokens[blockIdx.x];
+    float* xr = x + static_cast<size_t>(blockIdx.x) * hidden;
+    const uint8_t* er = embd + static_cast<size_t>(tok) * (hidden / 256) * 210;
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x)
+        xr[i] = gpuq::detail::q6k_at(er + (i / 256) * 210, i % 256);
+}
+
+// block per row; blockDim 256, same reduction as rmsnorm
+__global__ void rmsnorm_many(const float* x, const float* w, float* y, int n, float eps) {
+    const float* xr = x + static_cast<size_t>(blockIdx.x) * n;
+    float* yr = y + static_cast<size_t>(blockIdx.x) * n;
+    __shared__ float smem[256];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+    smem[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(smem[0] / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * scale * w[i];
+}
+
+// block per (row, head); blockDim 128, same reduction as rmsnorm_heads
+__global__ void rmsnorm_heads_many(float* v, const float* w, int head_dim, float eps,
+                                   int n_head) {
+    const int row = blockIdx.x / n_head, h = blockIdx.x % n_head;
+    float* x = v + (static_cast<size_t>(row) * n_head + h) * head_dim;
+    __shared__ float smem[128];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) ss += x[i] * x[i];
+    smem[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(smem[0] / head_dim + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) x[i] = x[i] * scale * w[i];
+}
+
+// block per (row, head): q heads then k heads; pos = pos_base + row
+__global__ void rope_rows(float* q, float* k, int n_q_head, int n_kv_head,
+                          int head_dim, int pos_base, float theta) {
+    const int nh = n_q_head + n_kv_head;
+    const int row = blockIdx.x / nh, h = blockIdx.x % nh;
+    const int pos = pos_base + row;
+    float* v = (h < n_q_head)
+        ? q + (static_cast<size_t>(row) * n_q_head + h) * head_dim
+        : k + (static_cast<size_t>(row) * n_kv_head + (h - n_q_head)) * head_dim;
+    const int half = head_dim / 2;
+    const int i = threadIdx.x;
+    if (i >= half) return;
+    const float freq = 1.0f / powf(theta, 2.0f * i / head_dim);
+    const float c = cosf(pos * freq), s = sinf(pos * freq);
+    const float a = v[i], b = v[i + half];
+    v[i] = a * c - b * s;
+    v[i + half] = b * c + a * s;
+}
+
+// block per row: copy k/v row into the cache at pos_base + row
+__global__ void kv_store_rows(const float* k, const float* v, float* kv,
+                              size_t layer_k_stride, size_t layer_v_stride,
+                              size_t head_stride, int n_kv_head, int head_dim,
+                              int pos_base) {
+    const int pos = pos_base + blockIdx.x;
+    const int total = n_kv_head * head_dim;
+    const float* kr = k + static_cast<size_t>(blockIdx.x) * total;
+    const float* vr = v + static_cast<size_t>(blockIdx.x) * total;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        const int h = i / head_dim, d = i % head_dim;
+        kv[layer_k_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = kr[i];
+        kv[layer_v_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = vr[i];
+    }
+}
+
+// causal prefill attention: block per (row, q head); query row r attends to
+// keys 0..pos_base+r. Scores staged in dynamic smem.
+// Phase 1 (scores): warp per t, lanes over head_dim (coalesced K reads) +
+//   shuffle reduce — a thread-per-t layout reads K rows strided and stalls.
+// Phase 3 (output): warp per 32-dim slice, lanes over d (coalesced V reads),
+//   sequential over t — the decode kernel's thread-per-d layout costs a
+//   serial T-loop of 512B-strided loads per thread and dominates at long T.
+// NOTE: the per-query arithmetic is unchanged, but the reduction ORDER inside
+// the score dot differs from the decode kernel (shuffle tree vs serial), so
+// prefill is allclose- but not bitwise-equivalent to sequential steps.
+__global__ void attention_prefill(const float* q, const float* kv, float* att,
+                                  size_t layer_k_stride, size_t layer_v_stride,
+                                  size_t head_stride, int n_head, int n_kv_head,
+                                  int head_dim, int pos_base, float scale) {
+    extern __shared__ float sm[];  // [T_max scores][128 reduction]
+    float* scores = sm;
+    float* red = sm + (pos_base + gridDim.x / n_head);  // upper bound T
+    const int r = blockIdx.x / n_head;
+    const int qh = blockIdx.x % n_head;
+    const int kvh = qh / (n_head / n_kv_head);
+    const float* q_h = q + (static_cast<size_t>(r) * n_head + qh) * head_dim;
+    const float* k_base = kv + layer_k_stride + kvh * head_stride;
+    const float* v_base = kv + layer_v_stride + kvh * head_stride;
+    const int T = pos_base + r + 1;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarp = blockDim.x >> 5;
+
+    // phase 1: scores (warp per key position)
+    float qpart[4];  // head_dim=128: each lane caches its 4 q values
+#pragma unroll
+    for (int i = 0; i < 4; ++i) qpart[i] = q_h[32 * i + lane];
+    for (int t = warp; t < T; t += nwarp) {
+        const float* kk = k_base + static_cast<size_t>(t) * head_dim;
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc += qpart[i] * kk[32 * i + lane];
+        for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncthreads();
+
+    // phase 2: softmax (block tree reductions, as the decode kernel)
+    float mx = -1e30f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) mx = fmaxf(mx, scores[t]);
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float sum = 0.0f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) {
+        scores[t] = expf(scores[t] - mx);
+        sum += scores[t];
+    }
+    __syncthreads();
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+
+    // phase 3: output — warp per 32-dim slice, lanes over d, sequential t
+    const int d = warp * 32 + lane;
+    if (d < head_dim) {
+        float acc = 0.0f;
+        for (int t = 0; t < T; ++t)
+            acc += scores[t] * inv * v_base[static_cast<size_t>(t) * head_dim + d];
+        att[(static_cast<size_t>(r) * n_head + qh) * head_dim + d] = acc;
+    }
+}
+
+__global__ void silu_up_many(float* gate, const float* up, int64_t n) {
+    const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (i < n) {
+        const float g = gate[i];
+        gate[i] = g / (1.0f + expf(-g)) * up[i];
+    }
+}
+
+__global__ void add_many(float* x, const float* y, int64_t n) {
+    const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
 // decode attention 等编排 kernel 之上是 decode gemv（见下）
 // v2: one warp per row, half2 vectorized loads (full 128B cacheline per warp
 // transaction), warp-shuffle reduction (no shared memory chain).
@@ -247,6 +434,50 @@ __global__ void gemv_f16_v2(const __half* w, const float* x, float* y, int in, i
     if (lane == 0) y[row] = acc;
 }
 
+// B8 multi-column F16 gemv: warp per R consecutive rows, NC activation
+// columns; x loaded once per (column, i) and reused across R rows (see the
+// Q4_K mc comment for why R>1 is required to stay DRAM-bound). Each
+// column/row bitwise-matches a single-column run.
+template <int R, int NC>
+__global__ void gemv_f16_mc_kernel(const __half* w, const float* x, float* y,
+                                   int in, int out) {
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * R;
+    if (row0 >= out) return;
+    float acc[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    const int n2 = in / 2;
+    for (int i = lane; i < n2; i += 32) {
+        float2 wv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            wv[r] = (row0 + r < out)
+                ? __half22float2(*reinterpret_cast<const __half2*>(
+                      w + static_cast<size_t>(row0 + r) * in + 2 * i))
+                : make_float2(0.0f, 0.0f);
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float2 xv = *reinterpret_cast<const float2*>(x + static_cast<size_t>(c) * in + 2 * i);
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r][c] += wv[r].x * xv.x + wv[r].y * xv.y;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= out) break;
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            float a = acc[r][c];
+            for (int off = 16; off; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) y[static_cast<size_t>(c) * out + row0 + r] = a;
+        }
+    }
+}
+
 // ---------------- impl ----------------
 
 struct LayerDev {
@@ -260,6 +491,21 @@ struct LayerDev {
 
 }  // namespace
 
+namespace gpuq {
+
+void gemv_f16_mc(const __half* w, const float* x, float* y, int in, int out,
+                 int ncol, cudaStream_t stream) {
+    const int grid = (out + 3) / 4;
+    if (ncol <= 1) { gemv_f16_v2<<<grid, 128, 0, stream>>>(w, x, y, in, out); return; }
+    auto grid_for = [out](int r) { return ((out + r - 1) / r + 3) / 4; };
+    if (ncol <= 2) gemv_f16_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else if (ncol <= 4) gemv_f16_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else if (ncol <= 8) gemv_f16_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
+    else gemv_f16_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, x, y, in, out);
+}
+
+}  // namespace gpuq
+
 struct GpuModel::Impl {
     ModelConfig cfg;
     DevWeight d_embd;                   // [hidden, vocab]
@@ -269,6 +515,12 @@ struct GpuModel::Impl {
     int kv_cap = 0;
     float *d_x, *d_h, *d_q, *d_k, *d_v, *d_att, *d_scores, *d_gate, *d_up, *d_ffn, *d_logits;
     float* h_logits = nullptr;        // pinned
+    // B8a batch-prefill buffers (MAX_MC columns per chunk)
+    static constexpr int MAX_MC = 16;
+    float *d_xm = nullptr, *d_hm = nullptr, *d_qm = nullptr, *d_km = nullptr,
+          *d_vm = nullptr, *d_attm = nullptr, *d_gatem = nullptr, *d_upm = nullptr,
+          *d_ffnm = nullptr;
+    int* d_tokens = nullptr;
     // decode-step streaming state: token/pos live in device memory so the
     // whole step (~450 kernel launches) can be CUDA-graph captured (B7).
     int* d_step = nullptr;            // [token, pos]
@@ -288,6 +540,9 @@ struct GpuModel::Impl {
         free_if(d_x); free_if(d_h); free_if(d_q); free_if(d_k); free_if(d_v);
         free_if(d_att); free_if(d_scores); free_if(d_gate); free_if(d_up);
         free_if(d_ffn); free_if(d_logits);
+        free_if(d_xm); free_if(d_hm); free_if(d_qm); free_if(d_km); free_if(d_vm);
+        free_if(d_attm); free_if(d_gatem); free_if(d_upm); free_if(d_ffnm);
+        free_if(d_tokens);
         if (graph_exec) cudaGraphExecDestroy(graph_exec);
         free_if(d_step);
         if (h_step) cudaFreeHost(h_step);
@@ -308,6 +563,74 @@ struct GpuModel::Impl {
         } else {
             gpuq::gemv_q6k(static_cast<const uint8_t*>(w.p), x, y, in, out, stream);
         }
+    }
+
+    // B8a multi-column dispatch (prefill chunks, ncol <= MAX_MC).
+    void gemv_mc(const DevWeight& w, const float* x, float* y, int in, int out, int ncol) {
+        if (w.type == 1) {
+            gpuq::gemv_f16_mc(static_cast<const __half*>(w.p), x, y, in, out, ncol, stream);
+        } else if (w.type == 12) {
+            gpuq::gemv_q4k_mc(static_cast<const uint8_t*>(w.p), x, y, in, out, ncol, stream);
+        } else {
+            gpuq::gemv_q6k_mc(static_cast<const uint8_t*>(w.p), x, y, in, out, ncol, stream);
+        }
+    }
+
+    // One prefill chunk: rows 0..nr-1 of the multi-column buffers are sequence
+    // positions pos_base..pos_base+nr-1. Bitwise-equivalent to nr sequential
+    // single-token steps (see the B8a kernel block above).
+    void prefill_chunk(int pos_base, int nr) {
+        const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
+        const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
+        const size_t layer_k_stride = static_cast<size_t>(cfg.n_kv_head) * kv_cap * cfg.head_dim;
+        const size_t layer_v_stride = layer_k_stride;
+        const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
+
+        if (d_embd.type == 1) {
+            embed_rows_f16<<<nr, 256, 0, stream>>>(static_cast<const __half*>(d_embd.p),
+                                                   d_xm, d_tokens, H);
+        } else {
+            embed_rows_q6k<<<nr, 256, 0, stream>>>(static_cast<const uint8_t*>(d_embd.p),
+                                                   d_xm, d_tokens, H);
+        }
+
+        for (int l = 0; l < cfg.n_layer; ++l) {
+            const LayerDev& w = layers[l];
+            const size_t lk = static_cast<size_t>(l) * 2 * layer_k_stride;
+            const size_t lv = lk + layer_v_stride;
+
+            rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, w.attn_norm, d_hm, H, cfg.rms_eps);
+            prof_begin(PH_GEMV); gemv_mc(w.wq, d_hm, d_qm, H, Q, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_mc(w.wk, d_hm, d_km, H, KV, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_mc(w.wv, d_hm, d_vm, H, KV, nr); prof_end(PH_GEMV);
+            rmsnorm_heads_many<<<nr * cfg.n_head, 128, 0, stream>>>(d_qm, w.q_norm, cfg.head_dim,
+                                                                    cfg.rms_eps, cfg.n_head);
+            rmsnorm_heads_many<<<nr * cfg.n_kv_head, 128, 0, stream>>>(d_km, w.k_norm, cfg.head_dim,
+                                                                       cfg.rms_eps, cfg.n_kv_head);
+            rope_rows<<<nr * (cfg.n_head + cfg.n_kv_head), cfg.head_dim / 2, 0, stream>>>(
+                d_qm, d_km, cfg.n_head, cfg.n_kv_head, cfg.head_dim, pos_base, cfg.rope_theta);
+            kv_store_rows<<<nr, 256, 0, stream>>>(d_km, d_vm, d_kv, lk, lv,
+                                                  head_stride, cfg.n_kv_head, cfg.head_dim, pos_base);
+            const int t_max = pos_base + nr;
+            prof_begin(PH_ATTN);
+            attention_prefill<<<nr * cfg.n_head, 128, (t_max + 128) * sizeof(float), stream>>>(
+                d_qm, d_kv, d_attm, lk, lv, head_stride, cfg.n_head, cfg.n_kv_head,
+                cfg.head_dim, pos_base, scale);
+            prof_end(PH_ATTN);
+            prof_begin(PH_GEMV); gemv_mc(w.wo, d_attm, d_ffnm, Q, H, nr); prof_end(PH_GEMV);
+            add_many<<<(int)((static_cast<int64_t>(nr) * H + 255) / 256), 256, 0, stream>>>(
+                d_xm, d_ffnm, static_cast<int64_t>(nr) * H);
+            rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, w.ffn_norm, d_hm, H, cfg.rms_eps);
+            prof_begin(PH_GEMV); gemv_mc(w.wg, d_hm, d_gatem, H, cfg.ffn, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_mc(w.wu, d_hm, d_upm, H, cfg.ffn, nr); prof_end(PH_GEMV);
+            silu_up_many<<<(int)((static_cast<int64_t>(nr) * cfg.ffn + 255) / 256), 256, 0, stream>>>(
+                d_gatem, d_upm, static_cast<int64_t>(nr) * cfg.ffn);
+            prof_begin(PH_GEMV); gemv_mc(w.wd, d_gatem, d_ffnm, cfg.ffn, H, nr); prof_end(PH_GEMV);
+            add_many<<<(int)((static_cast<int64_t>(nr) * H + 255) / 256), 256, 0, stream>>>(
+                d_xm, d_ffnm, static_cast<int64_t>(nr) * H);
+        }
+
+        rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, d_out_norm, d_hm, H, cfg.rms_eps);
     }
 
     // One decode step: embed + layers + final norm + logits gemv. Every
@@ -347,7 +670,7 @@ struct GpuModel::Impl {
             prof_begin(PH_ATTN);
             attention<<<cfg.n_head, 128, 0, stream>>>(d_q, d_kv, d_att, d_scores, lk, lv,
                                                       head_stride, cfg.n_head, cfg.n_kv_head,
-                                                      cfg.head_dim, d_pos, scale);
+                                                      cfg.head_dim, d_pos, scale, kv_cap);
             prof_end(PH_ATTN);
             prof_begin(PH_GEMV); gemv(w.wo, d_att, d_ffn, Q, H); prof_end(PH_GEMV);
             add_inplace<<<(H + 255) / 256, 256, 0, stream>>>(d_x, d_ffn, H);
@@ -471,7 +794,7 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap) {
     CU_CHECK(cudaMalloc(&m->d_k, KV * 4));
     CU_CHECK(cudaMalloc(&m->d_v, KV * 4));
     CU_CHECK(cudaMalloc(&m->d_att, Q * 4));
-    CU_CHECK(cudaMalloc(&m->d_scores, kv_cap * 4));
+    CU_CHECK(cudaMalloc(&m->d_scores, static_cast<size_t>(kv_cap) * c.n_head * 4));
     CU_CHECK(cudaMalloc(&m->d_gate, FF * 4));
     CU_CHECK(cudaMalloc(&m->d_up, FF * 4));
     CU_CHECK(cudaMalloc(&m->d_ffn, H * 4));
@@ -480,6 +803,18 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap) {
     CU_CHECK(cudaMalloc(&m->d_step, 2 * sizeof(int)));
     CU_CHECK(cudaMallocHost(&m->h_step, 2 * sizeof(int)));
     CU_CHECK(cudaStreamCreate(&m->stream));
+    // B8a batch-prefill buffers
+    const int MC = Impl::MAX_MC;
+    CU_CHECK(cudaMalloc(&m->d_xm, static_cast<size_t>(MC) * H * 4));
+    CU_CHECK(cudaMalloc(&m->d_hm, static_cast<size_t>(MC) * H * 4));
+    CU_CHECK(cudaMalloc(&m->d_qm, static_cast<size_t>(MC) * Q * 4));
+    CU_CHECK(cudaMalloc(&m->d_km, static_cast<size_t>(MC) * KV * 4));
+    CU_CHECK(cudaMalloc(&m->d_vm, static_cast<size_t>(MC) * KV * 4));
+    CU_CHECK(cudaMalloc(&m->d_attm, static_cast<size_t>(MC) * Q * 4));
+    CU_CHECK(cudaMalloc(&m->d_gatem, static_cast<size_t>(MC) * FF * 4));
+    CU_CHECK(cudaMalloc(&m->d_upm, static_cast<size_t>(MC) * FF * 4));
+    CU_CHECK(cudaMalloc(&m->d_ffnm, static_cast<size_t>(MC) * H * 4));
+    CU_CHECK(cudaMalloc(&m->d_tokens, MC * sizeof(int)));
     CU_CHECK(cudaDeviceSynchronize());
     m->prof_init();
     // CUDA graph replay per decode token (RADAR_NO_CUDA_GRAPH=1 to force eager;
@@ -525,6 +860,36 @@ int32_t GpuModel::forward_argmax(int32_t token, int pos) {
     m->prof_end(Impl::PH_TOTAL);
     m->prof_collect();
     return best;
+}
+
+// B8a: batch prefill. Feeds tokens[0..n) at positions 0..n-1 in MAX_MC-column
+// chunks (weights read once per chunk). Bitwise-equivalent to n sequential
+// forward_argmax state updates; the last position's logits go to logits_out.
+void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out) {
+    Impl* m = impl_;
+    const ModelConfig& c = m->cfg;
+    if (n <= 0 || n > m->kv_cap) fail("prefill length out of kv_cap range");
+    for (int base = 0; base < n; base += Impl::MAX_MC) {
+        const int nr = std::min(static_cast<int>(Impl::MAX_MC), n - base);
+        CU_CHECK(cudaMemcpyAsync(m->d_tokens, tokens + base, nr * sizeof(int),
+                                 cudaMemcpyHostToDevice, m->stream));
+        m->prof_begin(Impl::PH_TOTAL);
+        m->prefill_chunk(base, nr);
+        m->prof_end(Impl::PH_TOTAL);
+        m->prof_collect();
+    }
+    const int last = (n - 1) % Impl::MAX_MC;  // row of the last position
+    m->prof_begin(Impl::PH_LOGITS);
+    m->gemv(m->d_embd, m->d_hm + static_cast<size_t>(last) * c.hidden,
+            m->d_logits, c.hidden, c.vocab);
+    m->prof_end(Impl::PH_LOGITS);
+    m->prof_begin(Impl::PH_D2H);
+    CU_CHECK(cudaMemcpyAsync(logits_out, m->d_logits, c.vocab * sizeof(float),
+                             cudaMemcpyDeviceToHost, m->stream));
+    CU_CHECK(cudaStreamSynchronize(m->stream));
+    m->prof_end(Impl::PH_D2H);
+    m->prof_collect();
+    m->prof_print();
 }
 
 }  // namespace ri

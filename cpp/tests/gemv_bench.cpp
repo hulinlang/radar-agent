@@ -32,33 +32,40 @@ int bench(const ri::GGUFFile& f, const char* name, int iters) {
     uint8_t* dw = nullptr;
     float *dx = nullptr, *dy = nullptr;
     CU_CHECK(cudaMalloc(&dw, t->n_bytes));
-    CU_CHECK(cudaMalloc(&dx, in * sizeof(float)));
-    CU_CHECK(cudaMalloc(&dy, out * sizeof(float)));
+    CU_CHECK(cudaMalloc(&dx, static_cast<size_t>(16) * in * sizeof(float)));
+    CU_CHECK(cudaMalloc(&dy, static_cast<size_t>(16) * out * sizeof(float)));
     CU_CHECK(cudaMemcpy(dw, f.tensor_data(*t), t->n_bytes, cudaMemcpyHostToDevice));
-    CU_CHECK(cudaMemset(dx, 0, in * sizeof(float)));
+    CU_CHECK(cudaMemset(dx, 0, static_cast<size_t>(16) * in * sizeof(float)));
 
     const bool q4 = t->ggml_type == 12;
-    auto launch = [&] {
-        if (q4) ri::gpuq::gemv_q4k(dw, dx, dy, in, out);
-        else ri::gpuq::gemv_q6k(dw, dx, dy, in, out);
+    auto run = [&](int ncol) {
+        if (ncol <= 1) {
+            if (q4) ri::gpuq::gemv_q4k(dw, dx, dy, in, out);
+            else ri::gpuq::gemv_q6k(dw, dx, dy, in, out);
+        } else {
+            if (q4) ri::gpuq::gemv_q4k_mc(dw, dx, dy, in, out, ncol);
+            else ri::gpuq::gemv_q6k_mc(dw, dx, dy, in, out, ncol);
+        }
     };
-    launch();  // warmup
-    CU_CHECK(cudaDeviceSynchronize());
-    cudaEvent_t a, b;
-    CU_CHECK(cudaEventCreate(&a));
-    CU_CHECK(cudaEventCreate(&b));
-    CU_CHECK(cudaEventRecord(a));
-    for (int i = 0; i < iters; ++i) launch();
-    CU_CHECK(cudaEventRecord(b));
-    CU_CHECK(cudaEventSynchronize(b));
-    float ms = 0;
-    CU_CHECK(cudaEventElapsedTime(&ms, a, b));
-    cudaEventDestroy(a);
-    cudaEventDestroy(b);
-    const double gbps = static_cast<double>(t->n_bytes) * iters / (ms * 1e-3) / 1e9;
-    std::printf("%-26s %s %5dx%-6d %8.2f MB  %7.3f us/call  %6.1f GB/s\n", name,
-                q4 ? "Q4_K" : "Q6_K", in, out, t->n_bytes / 1e6,
-                ms * 1000.0 / iters, gbps);
+    for (int ncol : {1, 4, 8, 16}) {
+        run(ncol);  // warmup
+        CU_CHECK(cudaDeviceSynchronize());
+        cudaEvent_t a, b;
+        CU_CHECK(cudaEventCreate(&a));
+        CU_CHECK(cudaEventCreate(&b));
+        CU_CHECK(cudaEventRecord(a));
+        for (int i = 0; i < iters; ++i) run(ncol);
+        CU_CHECK(cudaEventRecord(b));
+        CU_CHECK(cudaEventSynchronize(b));
+        float ms = 0;
+        CU_CHECK(cudaEventElapsedTime(&ms, a, b));
+        cudaEventDestroy(a);
+        cudaEventDestroy(b);
+        const double gbps = static_cast<double>(t->n_bytes) * iters / (ms * 1e-3) / 1e9;
+        std::printf("%-26s %s %5dx%-6d ncol=%2d  %8.2f MB  %8.3f us/call  %6.1f GB/s\n",
+                    name, q4 ? "Q4_K" : "Q6_K", in, out, ncol, t->n_bytes / 1e6,
+                    ms * 1000.0 / iters, gbps);
+    }
     cudaFree(dw);
     cudaFree(dx);
     cudaFree(dy);
