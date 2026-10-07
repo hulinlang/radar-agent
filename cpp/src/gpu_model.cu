@@ -413,6 +413,136 @@ __global__ void add_many(float* x, const float* y, int64_t n) {
     if (i < n) x[i] += y[i];
 }
 
+// ---------------- B8b batch-decode kernels ----------------
+// Row = one sequence in the (padded) decode batch; per-row pos/slot come from
+// device arrays so the whole batch step is graph-capturable. Per-row math is
+// identical to the single-sequence kernels (bitwise per row).
+
+// block per (row, head): q heads then k heads; pos = pos_arr[row]
+__global__ void rope_batch(float* q, float* k, int n_q_head, int n_kv_head,
+                           int head_dim, const int* pos_arr, float theta) {
+    const int nh = n_q_head + n_kv_head;
+    const int row = blockIdx.x / nh, h = blockIdx.x % nh;
+    const int pos = pos_arr[row];
+    float* v = (h < n_q_head)
+        ? q + (static_cast<size_t>(row) * n_q_head + h) * head_dim
+        : k + (static_cast<size_t>(row) * n_kv_head + (h - n_q_head)) * head_dim;
+    const int half = head_dim / 2;
+    const int i = threadIdx.x;
+    if (i >= half) return;
+    const float freq = 1.0f / powf(theta, 2.0f * i / head_dim);
+    const float c = cosf(pos * freq), s = sinf(pos * freq);
+    const float a = v[i], b = v[i + half];
+    v[i] = a * c - b * s;
+    v[i + half] = b * c + a * s;
+}
+
+// block per row: copy k/v row into slot slots[row] at position pos_arr[row]
+__global__ void kv_store_batch(const float* k, const float* v, float* kv,
+                               size_t layer_k_stride, size_t layer_v_stride,
+                               size_t slot_stride, size_t head_stride,
+                               int n_kv_head, int head_dim,
+                               const int* pos_arr, const int* slot_arr) {
+    const int row = blockIdx.x;
+    const size_t base = static_cast<size_t>(slot_arr[row]) * slot_stride +
+                        static_cast<size_t>(pos_arr[row]) * head_dim;
+    const int total = n_kv_head * head_dim;
+    const float* kr = k + static_cast<size_t>(row) * total;
+    const float* vr = v + static_cast<size_t>(row) * total;
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        const int h = i / head_dim, d = i % head_dim;
+        kv[layer_k_stride + base + h * head_stride + d] = kr[i];
+        kv[layer_v_stride + base + h * head_stride + d] = vr[i];
+    }
+}
+
+// block per (row, q head); per-block math identical to the decode attention
+// kernel (same loop/reduction order -> bitwise per row)
+__global__ void attention_batch(const float* q, const float* kv, float* att, float* scores,
+                                size_t layer_k_stride, size_t layer_v_stride,
+                                size_t slot_stride, size_t head_stride,
+                                int n_head, int n_kv_head, int head_dim,
+                                const int* pos_arr, const int* slot_arr, float scale,
+                                int scores_stride) {
+    const int row = blockIdx.x / n_head, qh = blockIdx.x % n_head;
+    const int pos = pos_arr[row];
+    const int kvh = qh / (n_head / n_kv_head);
+    const size_t slot_base = static_cast<size_t>(slot_arr[row]) * slot_stride;
+    const float* q_h = q + (static_cast<size_t>(row) * n_head + qh) * head_dim;
+    const float* k_base = kv + layer_k_stride + slot_base + kvh * head_stride;
+    const float* v_base = kv + layer_v_stride + slot_base + kvh * head_stride;
+    scores += static_cast<size_t>(blockIdx.x) * scores_stride;
+    const int T = pos + 1;
+
+    for (int t = threadIdx.x; t < T; t += blockDim.x) {
+        const float* kk = k_base + static_cast<size_t>(t) * head_dim;
+        float acc = 0.0f;
+        for (int i = 0; i < head_dim; ++i) acc += q_h[i] * kk[i];
+        scores[t] = acc * scale;
+    }
+    __syncthreads();
+
+    __shared__ float red[128];
+    float mx = -1e30f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) mx = fmaxf(mx, scores[t]);
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    mx = red[0];
+    float sum = 0.0f;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) {
+        scores[t] = expf(scores[t] - mx);
+        sum += scores[t];
+    }
+    __syncthreads();
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / red[0];
+    if (threadIdx.x < head_dim) {
+        float acc = 0.0f;
+        for (int t = 0; t < T; ++t) {
+            acc += scores[t] * inv * v_base[static_cast<size_t>(t) * head_dim + threadIdx.x];
+        }
+        att[(static_cast<size_t>(row) * n_head + qh) * head_dim + threadIdx.x] = acc;
+    }
+}
+
+// block per row; (value, index) reduction with first-index tie-break, exactly
+// matching the host argmax loop (`if (v[i] > v[best]) best = i`)
+__global__ void argmax_rows(const float* x, int n, int32_t* out) {
+    const float* xr = x + static_cast<size_t>(blockIdx.x) * n;
+    __shared__ float sv[256];
+    __shared__ int32_t si[256];
+    float bv = -1e30f;
+    int32_t bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+    }
+    sv[threadIdx.x] = bv;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            const float ov = sv[threadIdx.x + s];
+            const int32_t oi = si[threadIdx.x + s];
+            if (ov > sv[threadIdx.x] || (ov == sv[threadIdx.x] && oi < si[threadIdx.x])) {
+                sv[threadIdx.x] = ov;
+                si[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = si[0];
+}
+
 // decode attention 等编排 kernel 之上是 decode gemv（见下）
 // v2: one warp per row, half2 vectorized loads (full 128B cacheline per warp
 // transaction), warp-shuffle reduction (no shared memory chain).
@@ -521,6 +651,16 @@ struct GpuModel::Impl {
           *d_vm = nullptr, *d_attm = nullptr, *d_gatem = nullptr, *d_upm = nullptr,
           *d_ffnm = nullptr;
     int* d_tokens = nullptr;
+    // B8b slot pool + batch decode state
+    int max_batch = 1;
+    int n_slots = 1;                // max_batch>1 -> max_batch+1 (last = pad scratch)
+    size_t slot_stride = 0;         // n_kv_head * kv_cap * head_dim
+    int *d_btok = nullptr, *d_bpos = nullptr, *d_bslot = nullptr;
+    int32_t* d_next = nullptr;
+    float* d_logitsm = nullptr;     // [max_batch][vocab]
+    int* h_bstage = nullptr;        // pinned [3*max_batch]: tok|pos|slot
+    int32_t* h_next = nullptr;      // pinned [max_batch]
+    cudaGraphExec_t graph_exec_b = nullptr;
     // decode-step streaming state: token/pos live in device memory so the
     // whole step (~450 kernel launches) can be CUDA-graph captured (B7).
     int* d_step = nullptr;            // [token, pos]
@@ -543,6 +683,11 @@ struct GpuModel::Impl {
         free_if(d_xm); free_if(d_hm); free_if(d_qm); free_if(d_km); free_if(d_vm);
         free_if(d_attm); free_if(d_gatem); free_if(d_upm); free_if(d_ffnm);
         free_if(d_tokens);
+        free_if(d_btok); free_if(d_bpos); free_if(d_bslot); free_if(d_next);
+        free_if(d_logitsm);
+        if (graph_exec_b) cudaGraphExecDestroy(graph_exec_b);
+        if (h_bstage) cudaFreeHost(h_bstage);
+        if (h_next) cudaFreeHost(h_next);
         if (graph_exec) cudaGraphExecDestroy(graph_exec);
         free_if(d_step);
         if (h_step) cudaFreeHost(h_step);
@@ -579,12 +724,13 @@ struct GpuModel::Impl {
     // One prefill chunk: rows 0..nr-1 of the multi-column buffers are sequence
     // positions pos_base..pos_base+nr-1. Bitwise-equivalent to nr sequential
     // single-token steps (see the B8a kernel block above).
-    void prefill_chunk(int pos_base, int nr) {
+    void prefill_chunk(int pos_base, int nr, int slot) {
         const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
         const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
-        const size_t layer_k_stride = static_cast<size_t>(cfg.n_kv_head) * kv_cap * cfg.head_dim;
+        const size_t layer_k_stride = static_cast<size_t>(n_slots) * slot_stride;
         const size_t layer_v_stride = layer_k_stride;
         const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
+        const size_t slot_off = static_cast<size_t>(slot) * slot_stride;
 
         if (d_embd.type == 1) {
             embed_rows_f16<<<nr, 256, 0, stream>>>(static_cast<const __half*>(d_embd.p),
@@ -596,7 +742,7 @@ struct GpuModel::Impl {
 
         for (int l = 0; l < cfg.n_layer; ++l) {
             const LayerDev& w = layers[l];
-            const size_t lk = static_cast<size_t>(l) * 2 * layer_k_stride;
+            const size_t lk = static_cast<size_t>(l) * 2 * layer_k_stride + slot_off;
             const size_t lv = lk + layer_v_stride;
 
             rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, w.attn_norm, d_hm, H, cfg.rms_eps);
@@ -633,6 +779,64 @@ struct GpuModel::Impl {
         rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, d_out_norm, d_hm, H, cfg.rms_eps);
     }
 
+    // B8b: one decode step for the full padded batch (max_batch rows). Row i
+    // reads token/pos/slot from device arrays; padding rows point at the
+    // scratch slot (max_batch). All launches on `stream`; graph-capturable.
+    void step_batch_kernels() {
+        const int B = max_batch;
+        const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
+        const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
+        const size_t layer_k_stride = static_cast<size_t>(n_slots) * slot_stride;
+        const size_t layer_v_stride = layer_k_stride;
+        const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
+
+        if (d_embd.type == 1) {
+            embed_rows_f16<<<B, 256, 0, stream>>>(static_cast<const __half*>(d_embd.p),
+                                                  d_xm, d_btok, H);
+        } else {
+            embed_rows_q6k<<<B, 256, 0, stream>>>(static_cast<const uint8_t*>(d_embd.p),
+                                                  d_xm, d_btok, H);
+        }
+
+        for (int l = 0; l < cfg.n_layer; ++l) {
+            const LayerDev& w = layers[l];
+            const size_t lk = static_cast<size_t>(l) * 2 * layer_k_stride;
+            const size_t lv = lk + layer_v_stride;
+
+            rmsnorm_many<<<B, 256, 0, stream>>>(d_xm, w.attn_norm, d_hm, H, cfg.rms_eps);
+            gemv_mc(w.wq, d_hm, d_qm, H, Q, B);
+            gemv_mc(w.wk, d_hm, d_km, H, KV, B);
+            gemv_mc(w.wv, d_hm, d_vm, H, KV, B);
+            rmsnorm_heads_many<<<B * cfg.n_head, 128, 0, stream>>>(d_qm, w.q_norm, cfg.head_dim,
+                                                                   cfg.rms_eps, cfg.n_head);
+            rmsnorm_heads_many<<<B * cfg.n_kv_head, 128, 0, stream>>>(d_km, w.k_norm, cfg.head_dim,
+                                                                      cfg.rms_eps, cfg.n_kv_head);
+            rope_batch<<<B * (cfg.n_head + cfg.n_kv_head), cfg.head_dim / 2, 0, stream>>>(
+                d_qm, d_km, cfg.n_head, cfg.n_kv_head, cfg.head_dim, d_bpos, cfg.rope_theta);
+            kv_store_batch<<<B, 256, 0, stream>>>(d_km, d_vm, d_kv, lk, lv, slot_stride,
+                                                  head_stride, cfg.n_kv_head, cfg.head_dim,
+                                                  d_bpos, d_bslot);
+            attention_batch<<<B * cfg.n_head, 128, 0, stream>>>(
+                d_qm, d_kv, d_attm, d_scores, lk, lv, slot_stride, head_stride,
+                cfg.n_head, cfg.n_kv_head, cfg.head_dim, d_bpos, d_bslot, scale, kv_cap);
+            gemv_mc(w.wo, d_attm, d_ffnm, Q, H, B);
+            add_many<<<(int)((static_cast<int64_t>(B) * H + 255) / 256), 256, 0, stream>>>(
+                d_xm, d_ffnm, static_cast<int64_t>(B) * H);
+            rmsnorm_many<<<B, 256, 0, stream>>>(d_xm, w.ffn_norm, d_hm, H, cfg.rms_eps);
+            gemv_mc(w.wg, d_hm, d_gatem, H, cfg.ffn, B);
+            gemv_mc(w.wu, d_hm, d_upm, H, cfg.ffn, B);
+            silu_up_many<<<(int)((static_cast<int64_t>(B) * cfg.ffn + 255) / 256), 256, 0, stream>>>(
+                d_gatem, d_upm, static_cast<int64_t>(B) * cfg.ffn);
+            gemv_mc(w.wd, d_gatem, d_ffnm, cfg.ffn, H, B);
+            add_many<<<(int)((static_cast<int64_t>(B) * H + 255) / 256), 256, 0, stream>>>(
+                d_xm, d_ffnm, static_cast<int64_t>(B) * H);
+        }
+
+        rmsnorm_many<<<B, 256, 0, stream>>>(d_xm, d_out_norm, d_hm, H, cfg.rms_eps);
+        gemv_mc(d_embd, d_hm, d_logitsm, H, cfg.vocab, B);
+        argmax_rows<<<B, 256, 0, stream>>>(d_logitsm, cfg.vocab, d_next);
+    }
+
     // One decode step: embed + layers + final norm + logits gemv. Every
     // launch goes to `stream` and token/pos come from device memory, so the
     // whole step is capturable into a CUDA graph (one replay per token
@@ -640,7 +844,7 @@ struct GpuModel::Impl {
     void step_kernels() {
         const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
         const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
-        const size_t layer_k_stride = static_cast<size_t>(cfg.n_kv_head) * kv_cap * cfg.head_dim;
+        const size_t layer_k_stride = static_cast<size_t>(n_slots) * slot_stride;
         const size_t layer_v_stride = layer_k_stride;
         const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
         const int* d_pos = d_step + 1;
@@ -741,7 +945,7 @@ GpuModel::GpuModel(GpuModel&& o) noexcept : impl_(o.impl_) { o.impl_ = nullptr; 
 GpuModel::~GpuModel() { delete impl_; }
 const ModelConfig& GpuModel::config() const { return impl_->cfg; }
 
-GpuModel GpuModel::load(const GGUFFile& f, int kv_cap) {
+GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch) {
     GpuModel gm;
     Impl* m = new Impl();
     gm.impl_ = m;
@@ -787,14 +991,24 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap) {
     }
 
     const size_t kv_elems = static_cast<size_t>(c.n_layer) * 2 * c.n_kv_head * kv_cap * c.head_dim;
-    CU_CHECK(cudaMalloc(&m->d_kv, kv_elems * sizeof(float)));
+    // B8b: slot pool. n_slots = max_batch+1 when batching (last slot is the
+    // padding scratch); shrink max_batch to fit 90% of free VRAM.
+    if (max_batch < 1) fail("max_batch must be >= 1");
+    if (max_batch > Impl::MAX_MC) max_batch = Impl::MAX_MC;
+    size_t free_bytes = 0, total_bytes = 0;
+    CU_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    while (max_batch > 1 && kv_elems * (max_batch + 1) * 4 > free_bytes * 9 / 10) max_batch >>= 1;
+    m->max_batch = max_batch;
+    m->n_slots = max_batch > 1 ? max_batch + 1 : 1;
+    m->slot_stride = static_cast<size_t>(c.n_kv_head) * kv_cap * c.head_dim;
+    CU_CHECK(cudaMalloc(&m->d_kv, kv_elems * m->n_slots * sizeof(float)));
     CU_CHECK(cudaMalloc(&m->d_x, H * 4));
     CU_CHECK(cudaMalloc(&m->d_h, H * 4));
     CU_CHECK(cudaMalloc(&m->d_q, Q * 4));
     CU_CHECK(cudaMalloc(&m->d_k, KV * 4));
     CU_CHECK(cudaMalloc(&m->d_v, KV * 4));
     CU_CHECK(cudaMalloc(&m->d_att, Q * 4));
-    CU_CHECK(cudaMalloc(&m->d_scores, static_cast<size_t>(kv_cap) * c.n_head * 4));
+    CU_CHECK(cudaMalloc(&m->d_scores, static_cast<size_t>(kv_cap) * c.n_head * max_batch * 4));
     CU_CHECK(cudaMalloc(&m->d_gate, FF * 4));
     CU_CHECK(cudaMalloc(&m->d_up, FF * 4));
     CU_CHECK(cudaMalloc(&m->d_ffn, H * 4));
@@ -803,6 +1017,16 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap) {
     CU_CHECK(cudaMalloc(&m->d_step, 2 * sizeof(int)));
     CU_CHECK(cudaMallocHost(&m->h_step, 2 * sizeof(int)));
     CU_CHECK(cudaStreamCreate(&m->stream));
+    if (max_batch > 1) {
+        // B8b batch-decode state
+        CU_CHECK(cudaMalloc(&m->d_btok, max_batch * sizeof(int)));
+        CU_CHECK(cudaMalloc(&m->d_bpos, max_batch * sizeof(int)));
+        CU_CHECK(cudaMalloc(&m->d_bslot, max_batch * sizeof(int)));
+        CU_CHECK(cudaMalloc(&m->d_next, max_batch * sizeof(int32_t)));
+        CU_CHECK(cudaMalloc(&m->d_logitsm, static_cast<size_t>(max_batch) * c.vocab * 4));
+        CU_CHECK(cudaMallocHost(&m->h_bstage, 3 * max_batch * sizeof(int)));
+        CU_CHECK(cudaMallocHost(&m->h_next, max_batch * sizeof(int32_t)));
+    }
     // B8a batch-prefill buffers
     const int MC = Impl::MAX_MC;
     CU_CHECK(cudaMalloc(&m->d_xm, static_cast<size_t>(MC) * H * 4));
@@ -865,16 +1089,17 @@ int32_t GpuModel::forward_argmax(int32_t token, int pos) {
 // B8a: batch prefill. Feeds tokens[0..n) at positions 0..n-1 in MAX_MC-column
 // chunks (weights read once per chunk). Bitwise-equivalent to n sequential
 // forward_argmax state updates; the last position's logits go to logits_out.
-void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out) {
+void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out, int slot) {
     Impl* m = impl_;
     const ModelConfig& c = m->cfg;
     if (n <= 0 || n > m->kv_cap) fail("prefill length out of kv_cap range");
+    if (slot < 0 || slot >= m->n_slots) fail("prefill slot out of range");
     for (int base = 0; base < n; base += Impl::MAX_MC) {
         const int nr = std::min(static_cast<int>(Impl::MAX_MC), n - base);
         CU_CHECK(cudaMemcpyAsync(m->d_tokens, tokens + base, nr * sizeof(int),
                                  cudaMemcpyHostToDevice, m->stream));
         m->prof_begin(Impl::PH_TOTAL);
-        m->prefill_chunk(base, nr);
+        m->prefill_chunk(base, nr, slot);
         m->prof_end(Impl::PH_TOTAL);
         m->prof_collect();
     }
@@ -890,6 +1115,48 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out) {
     m->prof_end(Impl::PH_D2H);
     m->prof_collect();
     m->prof_print();
+}
+
+int GpuModel::max_batch() const { return impl_->max_batch; }
+
+// B8b: one decode step for the padded batch. tokens/positions/slots are
+// max_batch-element host arrays; padding rows must use slot == max_batch
+// (scratch). Graph-captured at the first call, replayed afterwards.
+void GpuModel::decode_batch(const int32_t* tokens, const int* positions, const int* slots,
+                            int32_t* next_out) {
+    Impl* m = impl_;
+    const int B = m->max_batch;
+    if (B <= 1) fail("decode_batch requires max_batch > 1");
+    for (int i = 0; i < B; ++i) {
+        m->h_bstage[i] = tokens[i];
+        m->h_bstage[B + i] = positions[i];
+        m->h_bstage[2 * B + i] = slots[i];
+    }
+    CU_CHECK(cudaMemcpyAsync(m->d_btok, m->h_bstage, B * sizeof(int),
+                             cudaMemcpyHostToDevice, m->stream));
+    CU_CHECK(cudaMemcpyAsync(m->d_bpos, m->h_bstage + B, B * sizeof(int),
+                             cudaMemcpyHostToDevice, m->stream));
+    CU_CHECK(cudaMemcpyAsync(m->d_bslot, m->h_bstage + 2 * B, B * sizeof(int),
+                             cudaMemcpyHostToDevice, m->stream));
+    if (!m->graph_exec_b) {
+        if (std::getenv("RADAR_NO_CUDA_GRAPH") != nullptr) {
+            m->step_batch_kernels();  // eager debug path
+        } else {
+            cudaGraph_t g = nullptr;
+            CU_CHECK(cudaStreamBeginCapture(m->stream, cudaStreamCaptureModeGlobal));
+            m->step_batch_kernels();
+            CU_CHECK(cudaStreamEndCapture(m->stream, &g));
+            CU_CHECK(cudaGraphInstantiate(&m->graph_exec_b, g, nullptr, nullptr, 0));
+            CU_CHECK(cudaGraphDestroy(g));
+            CU_CHECK(cudaGraphLaunch(m->graph_exec_b, m->stream));
+        }
+    } else {
+        CU_CHECK(cudaGraphLaunch(m->graph_exec_b, m->stream));
+    }
+    CU_CHECK(cudaMemcpyAsync(m->h_next, m->d_next, B * sizeof(int32_t),
+                             cudaMemcpyDeviceToHost, m->stream));
+    CU_CHECK(cudaStreamSynchronize(m->stream));
+    std::memcpy(next_out, m->h_next, B * sizeof(int32_t));
 }
 
 }  // namespace ri
