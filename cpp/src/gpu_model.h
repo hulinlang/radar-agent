@@ -7,10 +7,10 @@ namespace ri {
 class GGUFFile;
 struct ModelConfig;
 
-// CUDA backend (B6b): F16 weights resident in VRAM, gemv via cublasGemmEx
-// (F16 storage / F32 compute / F32 output), small orchestration kernels
-// (rmsnorm / rope / attention / silu) handwritten. Same math as the CPU
-// semantic reference; only the execution site differs.
+// CUDA backend (B6b/B7): F16 or Q4_K/Q6_K weights resident in VRAM, decode
+// gemv via handwritten kernels (F32 activations/accumulation), small
+// orchestration kernels (rmsnorm / rope / attention / silu) handwritten.
+// Same math as the CPU semantic reference; only the execution site differs.
 class GpuModel {
 public:
     // Throws std::runtime_error on any CUDA/loading failure.
