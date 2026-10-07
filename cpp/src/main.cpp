@@ -18,6 +18,7 @@
 
 #include "gguf.h"
 #include "model.h"
+#include "sampler.h"
 #include "tokenizer.h"
 #ifdef USE_CUDA
 #include "gpu_model.h"
@@ -100,6 +101,17 @@ int main(int argc, char** argv) {
     int kv_cap = 0;
     int max_batch = 8;
     bool batch_prefill = true;
+    ri::Sampler sampler;
+    std::vector<int32_t> bans;
+    auto parse_bans = [&](const std::string& s) {
+        size_t b = 0;
+        while (b < s.size()) {
+            size_t e = s.find(',', b);
+            bans.push_back(std::stoi(s.substr(b, e == std::string::npos ? e : e - b)));
+            if (e == std::string::npos) break;
+            b = e + 1;
+        }
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* name) -> std::string {
@@ -117,6 +129,11 @@ int main(int argc, char** argv) {
         else if (a == "--teacher-file") teacher_path = need("--teacher-file");
         else if (a == "--backend") backend = need("--backend");
         else if (a == "--no-batch-prefill") batch_prefill = false;
+        else if (a == "--temp") sampler.temp = std::stof(need("--temp"));
+        else if (a == "--top-k") sampler.top_k = std::stoi(need("--top-k"));
+        else if (a == "--top-p") sampler.top_p = std::stof(need("--top-p"));
+        else if (a == "--seed") sampler.seed(std::stoull(need("--seed")));
+        else if (a == "--ban") parse_bans(need("--ban"));
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (prompt_files.size() == 1) prompt = read_file(prompt_files[0]);
@@ -266,15 +283,19 @@ int main(int argc, char** argv) {
         if (use_cuda) {
             ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap);
             const auto t0 = Clock::now();
+            std::vector<float> logits(gpu.config().vocab);
+            std::vector<float> scratch;
             int32_t next = 0;
             if (batch_prefill) {
                 // B8a: weights are read once per 16-token chunk instead of
                 // once per token; bitwise-identical KV/logits state.
-                std::vector<float> logits(gpu.config().vocab);
                 gpu.prefill_batch(ids.data(), static_cast<int>(ids.size()), logits.data());
-                next = argmax(logits);
+                next = ri::sample_from(sampler, bans, logits.data(), logits.size(), scratch);
             } else {
-                for (size_t i = 0; i < ids.size(); ++i) next = gpu.forward_argmax(ids[i], static_cast<int>(i));
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    gpu.forward_logits(ids[i], static_cast<int>(i), logits.data());
+                    next = ri::sample_from(sampler, bans, logits.data(), logits.size(), scratch);
+                }
             }
             const auto t1 = Clock::now();
 
@@ -295,7 +316,8 @@ int main(int argc, char** argv) {
             int pos = static_cast<int>(ids.size());
             while (static_cast<int>(gen.size()) < n_predict && next != tok.eos()) {
                 gen.push_back(next);
-                next = gpu.forward_argmax(next, pos++);
+                gpu.forward_logits(next, pos++, logits.data());
+                next = ri::sample_from(sampler, bans, logits.data(), logits.size(), scratch);
             }
             const auto t2 = Clock::now();
             const double pre_s = secs(t0, t1), dec_s = secs(t1, t2);
@@ -320,8 +342,9 @@ int main(int argc, char** argv) {
         const auto t1 = Clock::now();
 
         std::vector<int32_t> gen;
+        std::vector<float> scratch;
         int pos = static_cast<int>(ids.size());
-        int32_t next = argmax(*logits);
+        int32_t next = ri::sample_from(sampler, bans, logits->data(), logits->size(), scratch);
         debug_topk(*logits, 0);
 
         if (!teacher_path.empty()) {
@@ -343,7 +366,7 @@ int main(int argc, char** argv) {
         while (static_cast<int>(gen.size()) < n_predict && next != tok.eos()) {
             gen.push_back(next);
             logits = &model.forward(next, pos++);
-            next = argmax(*logits);
+            next = ri::sample_from(sampler, bans, logits->data(), logits->size(), scratch);
             debug_topk(*logits, static_cast<int>(gen.size()));
         }
         const auto t2 = Clock::now();

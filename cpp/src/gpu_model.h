@@ -26,16 +26,21 @@ public:
     const ModelConfig& config() const;
     int max_batch() const;
 
+    // Runs one token at absolute position pos; writes the vocab logits to
+    // logits_out (host buffer, vocab floats).
+    void forward_logits(int32_t token, int pos, float* logits_out);
+
     // Runs one token at absolute position pos; returns the argmax token id.
     int32_t forward_argmax(int32_t token, int pos);
 
-    // B8a: batch prefill. Feeds tokens[0..n) at positions 0..n-1 of KV slot
-    // `slot` with multi-column gemv kernels (weights read once per 16-token
-    // chunk). Attention score dots use a parallel reduction (allclose to, not
-    // bitwise-identical with, sequential steps); everything else preserves
-    // per-element op order. Writes the last position's logits (vocab floats)
-    // to logits_out. Eager path (not graph-captured).
-    void prefill_batch(const int32_t* tokens, int n, float* logits_out, int slot = 0);
+    // B8a: batch prefill. Feeds tokens[0..n) at positions pos0..pos0+n-1 of KV
+    // slot `slot` with multi-column gemv kernels (weights read once per
+    // 16-token chunk). Attention score dots use a parallel reduction
+    // (allclose to, not bitwise-identical with, sequential steps); everything
+    // else preserves per-element op order. Writes the last position's logits
+    // (vocab floats) to logits_out. Eager path (not graph-captured).
+    void prefill_batch(const int32_t* tokens, int n, float* logits_out,
+                       int slot = 0, int pos0 = 0);
 
     // B8b: one decode step for a padded batch of max_batch rows. Row i feeds
     // tokens[i] at positions[i] of KV slot slots[i]; padding rows must use

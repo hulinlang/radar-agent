@@ -1047,7 +1047,7 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch) {
     return gm;
 }
 
-int32_t GpuModel::forward_argmax(int32_t token, int pos) {
+void GpuModel::forward_logits(int32_t token, int pos, float* logits_out) {
     Impl* m = impl_;
     const ModelConfig& c = m->cfg;
     if (token < 0 || token >= c.vocab) fail("token out of range");
@@ -1074,32 +1074,38 @@ int32_t GpuModel::forward_argmax(int32_t token, int pos) {
         m->step_kernels();
     }
     m->prof_begin(Impl::PH_D2H);
-    CU_CHECK(cudaMemcpyAsync(m->h_logits, m->d_logits, c.vocab * sizeof(float),
+    CU_CHECK(cudaMemcpyAsync(logits_out, m->d_logits, c.vocab * sizeof(float),
                              cudaMemcpyDeviceToHost, m->stream));
     CU_CHECK(cudaStreamSynchronize(m->stream));
-
-    int32_t best = 0;
-    for (int i = 1; i < c.vocab; ++i) if (m->h_logits[i] > m->h_logits[best]) best = i;
     m->prof_end(Impl::PH_D2H);
     m->prof_end(Impl::PH_TOTAL);
     m->prof_collect();
+}
+
+int32_t GpuModel::forward_argmax(int32_t token, int pos) {
+    Impl* m = impl_;
+    forward_logits(token, pos, m->h_logits);
+    const int vocab = m->cfg.vocab;
+    int32_t best = 0;
+    for (int i = 1; i < vocab; ++i) if (m->h_logits[i] > m->h_logits[best]) best = i;
     return best;
 }
 
 // B8a: batch prefill. Feeds tokens[0..n) at positions 0..n-1 in MAX_MC-column
 // chunks (weights read once per chunk). Bitwise-equivalent to n sequential
 // forward_argmax state updates; the last position's logits go to logits_out.
-void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out, int slot) {
+void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
+                             int slot, int pos0) {
     Impl* m = impl_;
     const ModelConfig& c = m->cfg;
-    if (n <= 0 || n > m->kv_cap) fail("prefill length out of kv_cap range");
+    if (n <= 0 || pos0 < 0 || pos0 + n > m->kv_cap) fail("prefill range out of kv_cap");
     if (slot < 0 || slot >= m->n_slots) fail("prefill slot out of range");
     for (int base = 0; base < n; base += Impl::MAX_MC) {
         const int nr = std::min(static_cast<int>(Impl::MAX_MC), n - base);
         CU_CHECK(cudaMemcpyAsync(m->d_tokens, tokens + base, nr * sizeof(int),
                                  cudaMemcpyHostToDevice, m->stream));
         m->prof_begin(Impl::PH_TOTAL);
-        m->prefill_chunk(base, nr, slot);
+        m->prefill_chunk(pos0 + base, nr, slot);
         m->prof_end(Impl::PH_TOTAL);
         m->prof_collect();
     }

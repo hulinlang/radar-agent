@@ -26,6 +26,9 @@ add_executable(gguf-dump src/gguf.cpp src/gguf_dump.cpp)
 # B2：byte-level BPE 分词器 + 对拍测试
 add_executable(tokenizer-test src/gguf.cpp src/tokenizer.cpp src/tokenizer_test.cpp)
 
+# B9a：host 采样器单元测试（纯 CPU，无模型依赖）
+add_executable(sampler-test tests/sampler_test.cpp)
+
 # B3：CPU 前向（语义基准）+ 逐层对拍
 add_executable(forward-test src/gguf.cpp src/ops.cpp src/quants.cpp src/simd_avx2.cpp src/model.cpp src/forward_test.cpp)
 
@@ -60,6 +63,10 @@ if(CMAKE_CUDA_COMPILER)
   target_link_libraries(radar_gpu PRIVATE CUDA::cudart)
   target_compile_definitions(radar-infer PRIVATE USE_CUDA)
   target_link_libraries(radar-infer PRIVATE radar_gpu CUDA::cudart)
+# B9b：radar-serve（最小 HTTP + LCP 会话复用）
+  add_executable(radar-serve src/gguf.cpp src/tokenizer.cpp src/serve.cpp)
+  target_include_directories(radar-serve PRIVATE src)
+  target_link_libraries(radar-serve PRIVATE radar_gpu CUDA::cudart)
   add_executable(gpu-quants-test src/gguf.cpp src/quants.cpp tests/gpu_quants_test.cpp)
   target_include_directories(gpu-quants-test PRIVATE src)
   target_link_libraries(gpu-quants-test PRIVATE radar_gpu CUDA::cudart)

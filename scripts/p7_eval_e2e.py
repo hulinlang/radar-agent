@@ -120,9 +120,11 @@ def main() -> int:
     ap.add_argument("--tag", default="e2e")
     ap.add_argument("--seed", type=int, default=42)
     # ---- P10：llama-server 部署形态（GGUF）----
-    ap.add_argument("--backend", choices=["hf", "llamacpp"], default="hf",
-                    help="hf=进程内加载（原形态）；llamacpp=生成走外部 llama-server（P10 部署形态）")
+    ap.add_argument("--backend", choices=["hf", "llamacpp", "radarinfer"], default="hf",
+                    help="hf=进程内加载（原形态）；llamacpp=生成走外部 llama-server（P10 部署形态）；"
+                         "radarinfer=生成走自研 radar-serve（P10-B9，需已在 WSL 内启动）")
     ap.add_argument("--llama-url", default="http://127.0.0.1:8080")
+    ap.add_argument("--radar-url", default="http://127.0.0.1:8090")
     ap.add_argument("--spawn-server", action="store_true",
                     help="按部署配置自动拉起本地 llama-server，评测结束自动关闭")
     ap.add_argument("--deploy-config", default="configs/deploy_gguf.yaml",
@@ -196,7 +198,12 @@ def main() -> int:
     gen_backend = None
     model = None
     server_engine = None
-    if args.backend == "llamacpp":
+    if args.backend == "radarinfer":
+        from src.engines.react_radarinfer import RadarInferGenBackend
+        gen_backend = RadarInferGenBackend(tok, base_url=args.radar_url)
+        impl = "radarinfer(自研 C++ 引擎)"
+        print(f"[e2e] 生成后端 = radar-serve {args.radar_url}（进程内不加载模型权重）", flush=True)
+    elif args.backend == "llamacpp":
         from src.engines.react_llamacpp import LlamaCppGenBackend
         if args.spawn_server:
             from src.engines import substitute_paths

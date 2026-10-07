@@ -45,10 +45,14 @@ SMOKE_QUESTIONS = [
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="P10 logit_bias 护栏等效性探针")
-    ap.add_argument("--url", default="http://127.0.0.1:8080")
+    ap.add_argument("--engine", choices=["llamacpp", "radarinfer"], default="llamacpp",
+                    help="llamacpp=llama-server（8080）；radarinfer=自研 radar-serve（8090，B9）")
+    ap.add_argument("--url", default=None, help="缺省按 engine 取 8080/8090")
     ap.add_argument("--spawn", action="store_true",
-                    help="按 configs/deploy_gguf.yaml 自动拉起本地 llama-server")
+                    help="按 configs/deploy_gguf.yaml 自动拉起本地 llama-server（仅 llamacpp）")
     args = ap.parse_args()
+    if args.url is None:
+        args.url = "http://127.0.0.1:8080" if args.engine == "llamacpp" else "http://127.0.0.1:8090"
 
     from transformers import AutoTokenizer
 
@@ -73,7 +77,11 @@ def main() -> int:
         base_cfg = load_config()
         tok = AutoTokenizer.from_pretrained(
             base_cfg["paths"]["model_base_dir"], trust_remote_code=False)
-        backend = LlamaCppGenBackend(tok, base_url=args.url)
+        if args.engine == "radarinfer":
+            from src.engines.react_radarinfer import RadarInferGenBackend
+            backend = RadarInferGenBackend(tok, base_url=args.url)
+        else:
+            backend = LlamaCppGenBackend(tok, base_url=args.url)
         print(f"[probe] 服务就绪: {backend.server_info}\n", flush=True)
 
         # ---- A：开 bias → 必须无 <tool_call>（critical）----
