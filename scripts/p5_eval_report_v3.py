@@ -44,7 +44,7 @@ D6 **小样本组未标注**：readout 只有 3 条，v2 却把它单列成亮�
 import io, os, json, re, html, collections, statistics as st
 import pathlib, sys
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
 REPORTS = os.path.join(ROOT, "reports")
 
 # ⚠️ 判分逻辑已迁到 `src/eval/scoring.py`（2026-09-21），这里改为 import。

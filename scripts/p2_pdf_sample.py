@@ -17,7 +17,7 @@ from pathlib import Path
 
 import fitz  # pymupdf
 
-PDF = Path(r"F:/Qwen3-2B/知识库/机载雷达系统与信息处理_15097299.pdf")
+PDF = Path(r"F:/Qwen3-2B - dsh/知识库/机载雷达系统与信息处理_15097299.pdf")
 
 
 def main() -> None:

@@ -11,8 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-OUT = Path(r"F:\Qwen3-2B\radar-agent\logs\probe\p9_chain_probe.txt")
-ROOT = Path(r"F:\Qwen3-2B\radar-agent")
+OUT = Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\probe\p9_chain_probe.txt")
+ROOT = Path(r"F:\Qwen3-2B - dsh\radar-agent")
 
 buf = []
 

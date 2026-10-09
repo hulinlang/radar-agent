@@ -16,7 +16,7 @@ from pathlib import Path
 
 import fitz
 
-PDF = Path(r"F:/Qwen3-2B/知识库/机载雷达系统与信息处理_15097299.pdf")
+PDF = Path(r"F:/Qwen3-2B - dsh/知识库/机载雷达系统与信息处理_15097299.pdf")
 
 # 章节页眉形如 "第1 章  机载雷达概述和应用 \n35"
 _RE_HEADER = re.compile(r"第\s*\d+\s*章\s*\S+")

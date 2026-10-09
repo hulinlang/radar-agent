@@ -16,8 +16,8 @@ import json
 import struct
 from pathlib import Path
 
-GGUF_DIR = Path(r"F:\Qwen3-2B\radar-agent\models\gguf")
-MODEL_DIR = Path(r"F:\Qwen3-2B\dir")
+GGUF_DIR = Path(r"F:\Qwen3-2B - dsh\radar-agent\models\gguf")
+MODEL_DIR = Path(r"F:\Qwen3-2B - dsh\dir")
 
 # GGUF 元数据类型枚举
 T_UINT8, T_INT8, T_UINT16, T_INT16 = 0, 1, 2, 3
@@ -126,5 +126,5 @@ for name in ("Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj-Qwen3VL-2B-Instruct-F16.
         out.append(f"    GGUF 尾部 160: {ct[-160:]!r}")
 
 txt = "\n".join(out)
-Path(r"F:\Qwen3-2B\radar-agent\logs\p1_gguf_meta.txt").write_text(txt, encoding="utf-8")
+Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\p1_gguf_meta.txt").write_text(txt, encoding="utf-8")
 print(txt)

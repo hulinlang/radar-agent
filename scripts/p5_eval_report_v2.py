@@ -25,7 +25,7 @@ D3 ⭐ **没有"格式失效"检测**：微调后 13 条 concept 开放题输出
 """
 import io, os, json, re, html, collections, statistics as st
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
 REPORTS = os.path.join(ROOT, "reports")
 
 REFUSAL_MARKS = ["无法回答", "未找到", "没有找到", "没有相关", "资料中未", "无法给出", "不能回答"]

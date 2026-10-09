@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
 PY = r"E:\Miniconda\envs\qwen3vl\python.exe"
 OUT = "logs/probe/_verify_new"
 os.makedirs(os.path.join(ROOT, OUT), exist_ok=True)

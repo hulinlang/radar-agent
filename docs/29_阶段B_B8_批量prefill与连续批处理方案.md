@@ -123,7 +123,7 @@ prefill = prompt 逐 token 调 decode 步（N 个 token = N 遍全权重读取�
 | DoD | 结果 | 说明 |
 |---|---|---|
 | 1. 批量逐 id 一致 | ✅ **达成且加强** | 批跑 8/8、连续批（16 请求 8 槽周转）16/16 **逐 id 完全相同**；B8a 批量 prefill 在 22/132/572/1280 token prompt 上与逐 token 路径生成 id 全同 |
-| 2. prefill 正确 + ≥1000 tok/s | ⚠️ **部分达成** | 正确性 bitwise 级全过；吞吐实测 **567-616 tok/s = 逐 token 的 5.3×**（未达 1000，根因见 §7.3——fp32 精确 dequant 多列 kernel 是指令发射 bound，生产答案是 dp4a/MMQ，另立项） |
+| 2. prefill 正确 + ≥1000 tok/s | ⚠️ **部分达成** | 正确性 bitwise 级全过；吞吐实测 **567–616 tok/s（4.8–5.3×，随 prompt 长度；逐行数据见 §7.2）**（未达 1000，根因见 §7.3——fp32 精确 dequant 多列 kernel 是指令发射 bound，生产答案是 dp4a/MMQ，另立项） |
 | 3. decode 聚合 ≥4× 单序列 | ⚠️ 边缘 | 实测 **469.6 tok/s @ B=8（vs 单序列 118.5 = 3.96×）**；16 请求连续批 431.1。padding 尾损 + mc kernel issue-bound 是主因 |
 | 4. 回归 B6/B7 | ✅ | B7 5/5（Q4 118.5 vs llama 116.5）、B6 7/7（F16 100/100 逐 id × 5 prompt） |
 | 5. 文档 + commit | ✅ | 本文 + docs/27 §4 更新 |

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 SRC = Path(r"C:\Users\hulinlang\Desktop\招聘相关\胡琳琅_简历.pdf")
-OUT = Path(r"F:\Qwen3-2B\radar-agent\logs\p9_resume.txt")
+OUT = Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\p9_resume.txt")
 
 
 def try_pypdf():

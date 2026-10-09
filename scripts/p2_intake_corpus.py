@@ -27,12 +27,12 @@ MANIFEST = DATA_RAW / "_intake_manifest.json"
 # (源文件, 用途说明, 资料性质)
 SOURCES: list[tuple[Path, str, str]] = [
     (
-        Path(r"F:/Qwen3-2B/知识库/机载雷达系统与信息处理_15097299.pdf"),
+        Path(r"F:/Qwen3-2B - dsh/知识库/机载雷达系统与信息处理_15097299.pdf"),
         "L2 教材抽取主力：散文供 evidence.quote，目录供结构化切分",
         "公开发行正式出版物（ISBN 978-7-121-41746-7，电子工业出版社 2021.8，定价 79.00 元）",
     ),
     (
-        Path(r"F:/Qwen3-2B/知识库/15625729.pdf"),
+        Path(r"F:/Qwen3-2B - dsh/知识库/15625729.pdf"),
         "扫描版（无文字层）；2026-09-15 用户拍板搁置，仅作留档",
         "待确认；因搁置暂不使用，故未参与任何出题与外发",
     ),

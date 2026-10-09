@@ -32,7 +32,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MINERU_PY = Path(r"E:/Miniconda/envs/mineru/Scripts/python.exe")
-KB = Path(r"F:/Qwen3-2B/知识库")
+KB = Path(r"F:/Qwen3-2B - dsh/知识库")
 OUT_ROOT = ROOT / "data_processed" / "corpus" / "papers_mineru"
 
 BOOK = "机载雷达系统与信息处理_15097299.pdf"   # 教材本身不进文献语料（已另有 chunks.jsonl）

@@ -7,10 +7,10 @@ from pathlib import Path
 # 用法：python scripts/p9_clean_scan.py <md路径> [输出txt路径]
 # 不传参时默认扫 14 号文档。结果落盘 + 打印（本机 PowerShell 不回显 stdout，必须落盘）。
 P = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
-    r"F:\Qwen3-2B\radar-agent\docs\14_校招技能对照与补强路线.md"
+    r"F:\Qwen3-2B - dsh\radar-agent\docs\14_校招技能对照与补强路线.md"
 )
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(
-    r"F:\Qwen3-2B\radar-agent\logs\p9_clean_scan.txt"
+    r"F:\Qwen3-2B - dsh\radar-agent\logs\p9_clean_scan.txt"
 )
 # 允许的符号扩展集（项目文档里本来就用的）
 ALLOW_EXTRA = set(

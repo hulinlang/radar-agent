@@ -7,11 +7,11 @@ import sys
 
 import yaml
 
-sys.path.insert(0, r"F:\Qwen3-2B\radar-agent")
+sys.path.insert(0, r"F:\Qwen3-2B - dsh\radar-agent")
 from src.dataset import formulas
 
 pool = yaml.safe_load(
-    open(r"F:\Qwen3-2B\radar-agent\configs\param_pool.yaml", encoding="utf-8")
+    open(r"F:\Qwen3-2B - dsh\radar-agent\configs\param_pool.yaml", encoding="utf-8")
 )["pools"]
 
 print("参数池公式数: %d　注册表公式数: %d" % (len(pool), len(formulas.REGISTRY)))

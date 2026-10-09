@@ -18,8 +18,8 @@ import pathlib
 import time
 import traceback
 
-MODEL = r"F:\Qwen3-2B\dir"
-OUT = pathlib.Path(r"F:\Qwen3-2B\radar-agent\logs\probe\p3_cot_probe.txt")
+MODEL = r"F:\Qwen3-2B - dsh\dir"
+OUT = pathlib.Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\probe\p3_cot_probe.txt")
 
 _lines: list[str] = []
 

@@ -25,8 +25,8 @@ import zlib
 from pathlib import Path
 
 PDFS = [
-    Path(r"F:/Qwen3-2B/知识库/机载雷达系统与信息处理_15097299.pdf"),
-    Path(r"F:/Qwen3-2B/知识库/15625729.pdf"),
+    Path(r"F:/Qwen3-2B - dsh/知识库/机载雷达系统与信息处理_15097299.pdf"),
+    Path(r"F:/Qwen3-2B - dsh/知识库/15625729.pdf"),
 ]
 
 _RE_PAGE = re.compile(rb"/Type\s*/Page(?![s])")

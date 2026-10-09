@@ -29,7 +29,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-ROOT = Path(r"F:\Qwen3-2B\radar-agent")
+ROOT = Path(r"F:\Qwen3-2B - dsh\radar-agent")
 sys.path.insert(0, str(ROOT))
 
 # ---------------------------------------------------------------- 期望行为

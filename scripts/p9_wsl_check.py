@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-OUT = Path(r"F:\Qwen3-2B\radar-agent\logs\probe\p9_wsl_check.txt")
+OUT = Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\probe\p9_wsl_check.txt")
 WSL = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wsl.exe")
 DISTRO = "Ubuntu-24.04"
 
