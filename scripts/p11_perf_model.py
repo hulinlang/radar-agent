@@ -406,6 +406,27 @@ def main() -> int:
     chart_path = PROJECT_ROOT / "reports" / "p11_roofline.png"
     chart_ok = False
 
+    # ⚠️ 顺序很重要：**先画图、再写报告**。
+    #    否则报告里的图引用可能指向一个当时还不存在、或绘图失败后被删掉的文件
+    #    —— 又一个「看着有其实没有」的静默错误。
+    if not args.dry_run and not args.no_chart:
+        # 先删旧图：失败时绝不能留下「上一次成功的图」冒充本次产物
+        chart_path.unlink(missing_ok=True)
+        try:
+            draw_roofline(gpu, model, prec_all, est, rows, pf, gemm, bw_gbps, bw_nature, chart_path)
+            chart_ok = True
+            log.info("Roofline 图已落盘: %s", chart_path)
+        except Exception as exc:  # noqa: BLE001 - 缺 matplotlib 不该让整个脚本失败
+            log.warning("绘图失败（不影响结论，且已删除旧图避免误导）: %s: %s",
+                        type(exc).__name__, exc)
+    if chart_ok:
+        # 图确认落盘后才把引用写进报告
+        report = report.replace(
+            "## 1. 模型自检",
+            f"![Roofline 性能模型（算子层 ↔ 引擎层）]({chart_path.name})\n\n"
+            f"> 图：`reports/{chart_path.name}`（双对数 Roofline，两条屋顶线 + 全部实测点）。\n\n"
+            "## 1. 模型自检", 1)
+
     if not args.dry_run:
         out_md = PROJECT_ROOT / "reports" / "P11_Roofline性能模型.md"
         out_md.write_text(report, encoding="utf-8")
@@ -414,18 +435,6 @@ def main() -> int:
         dump_config(cfg, run_dir / "config.yaml")
         (run_dir / "perf_model.yaml").write_text(
             Path(cfg["_config_path"]).read_text(encoding="utf-8"), encoding="utf-8")
-
-        if not args.no_chart:
-            # ⚠️ 先删旧图：绘图失败时**绝不能**留下「上一次成功的图」冒充本次产物
-            #    —— 那正是 §4.6 说的静默错误（图看着有，内容却是旧的）。
-            chart_path.unlink(missing_ok=True)
-            try:
-                draw_roofline(gpu, model, prec_all, est, rows, pf, gemm, bw_gbps, bw_nature, chart_path)
-                chart_ok = True
-                log.info("Roofline 图已落盘: %s", chart_path)
-            except Exception as exc:  # noqa: BLE001 - 缺 matplotlib 不该让整个脚本失败
-                log.warning("绘图失败（不影响结论，且已删除旧图避免误导）: %s: %s",
-                            type(exc).__name__, exc)
 
         metrics = {
             "config_path": cfg["_config_path"],
