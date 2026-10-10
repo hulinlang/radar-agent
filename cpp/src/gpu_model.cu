@@ -148,17 +148,33 @@ __global__ void rope_qk(float* q, float* k, int n_q_head, int head_dim,
     v[i + half] = b * c + a * s;
 }
 
+// ---------------- B10: paged KV ----------------
+// KV lives in a pool of fixed-size blocks (BLOCK tokens each). A sequence's
+// blocks are described by a device-side block table
+// (block_table[seq * max_blocks + b]) plus a per-sequence valid-block count
+// (nblk[seq]). Both live in device memory on purpose: the batch-decode CUDA
+// graph bakes pointers and launch shapes, not buffer *contents*, so a sequence
+// growing into a new block does not invalidate an already-captured graph.
+//
+// BLOCK is a compile-time power of two, so pos/BLOCK and pos%BLOCK compile to
+// a shift and a mask (no integer division in the inner loops).
+constexpr int BLOCK = 16;
+
 __global__ void kv_store(const float* k, const float* v, float* kv,
                          size_t layer_k_stride, size_t layer_v_stride,
-                         size_t head_stride, int n_kv_head, int head_dim,
-                         const int* pos_p) {
+                         size_t block_stride, size_t head_stride,
+                         int n_kv_head, int head_dim,
+                         const int* block_table, const int* pos_p) {
     const int pos = *pos_p;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = n_kv_head * head_dim;
     if (i >= total) return;
     const int h = i / head_dim, d = i % head_dim;
-    kv[layer_k_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = k[i];
-    kv[layer_v_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = v[i];
+    const size_t off = static_cast<size_t>(block_table[pos / BLOCK]) * block_stride +
+                       static_cast<size_t>(h) * head_stride +
+                       static_cast<size_t>(pos % BLOCK) * head_dim + d;
+    kv[layer_k_stride + off] = k[i];
+    kv[layer_v_stride + off] = v[i];
 }
 
 // decode attention: one block per q head; pos from device memory (graph-safe).
@@ -166,20 +182,27 @@ __global__ void kv_store(const float* k, const float* v, float* kv,
 // across head blocks is a latent data race (fixed in B8; long prompts
 // corrupted the softmax and produced NaN -> argmax 0 loops).
 __global__ void attention(const float* q, const float* kv, float* att, float* scores,
-                          size_t layer_k_stride, size_t layer_v_stride, size_t head_stride,
+                          size_t layer_k_stride, size_t layer_v_stride,
+                          size_t block_stride, size_t head_stride,
                           int n_head, int n_kv_head, int head_dim, const int* pos_p,
-                          float scale, int scores_stride) {
+                          float scale, int scores_stride,
+                          const int* block_table, const int* nblk_p) {
     const int pos = *pos_p;
     const int qh = blockIdx.x;
     scores += static_cast<size_t>(qh) * scores_stride;
     const int kvh = qh / (n_head / n_kv_head);
     const float* q_h = q + qh * head_dim;
-    const float* k_base = kv + layer_k_stride + kvh * head_stride;
-    const float* v_base = kv + layer_v_stride + kvh * head_stride;
     const int T = pos + 1;
+    const int nb = *nblk_p;   // device-side: keeps the CUDA graph valid
 
+    // score phase: one block indirection per t. Each t is written exactly once
+    // with the same inner reduction over head_dim as the contiguous version, so
+    // the thread-to-t mapping change does not affect any value.
     for (int t = threadIdx.x; t < T; t += blockDim.x) {
-        const float* kk = k_base + static_cast<size_t>(t) * head_dim;
+        const float* kb = kv + layer_k_stride +
+                          static_cast<size_t>(block_table[t / BLOCK]) * block_stride +
+                          kvh * head_stride;
+        const float* kk = kb + static_cast<size_t>(t % BLOCK) * head_dim;
         float acc = 0.0f;
         for (int i = 0; i < head_dim; ++i) acc += q_h[i] * kk[i];
         scores[t] = acc * scale;
@@ -211,8 +234,16 @@ __global__ void attention(const float* q, const float* kv, float* att, float* sc
     const float inv = 1.0f / red[0];
     if (threadIdx.x < head_dim) {
         float acc = 0.0f;
-        for (int t = 0; t < T; ++t) {
-            acc += scores[t] * inv * v_base[static_cast<size_t>(t) * head_dim + threadIdx.x];
+        // ⚠️ 必须按「块递增 → 块内位置递增」遍历：原实现是 for t=0..T 顺序累加，
+        //    保持同一枚举顺序才能保证浮点逐位相同 —— 这就是 DoD#1 硬口径的依据。
+        for (int b = 0; b < nb; ++b) {
+            const float* vb = kv + layer_v_stride +
+                              static_cast<size_t>(block_table[b]) * block_stride +
+                              kvh * head_stride;
+            const int lo = b * BLOCK;
+            const int jmax = (lo + BLOCK < T) ? BLOCK : (T - lo);
+            for (int j = 0; j < jmax; ++j)
+                acc += scores[lo + j] * inv * vb[static_cast<size_t>(j) * head_dim + threadIdx.x];
         }
         att[qh * head_dim + threadIdx.x] = acc;
     }
@@ -311,16 +342,19 @@ __global__ void rope_rows(float* q, float* k, int n_q_head, int n_kv_head,
 // block per row: copy k/v row into the cache at pos_base + row
 __global__ void kv_store_rows(const float* k, const float* v, float* kv,
                               size_t layer_k_stride, size_t layer_v_stride,
-                              size_t head_stride, int n_kv_head, int head_dim,
-                              int pos_base) {
+                              size_t block_stride, size_t head_stride,
+                              int n_kv_head, int head_dim,
+                              const int* block_table, int pos_base) {
     const int pos = pos_base + blockIdx.x;
     const int total = n_kv_head * head_dim;
     const float* kr = k + static_cast<size_t>(blockIdx.x) * total;
     const float* vr = v + static_cast<size_t>(blockIdx.x) * total;
+    const size_t off = static_cast<size_t>(block_table[pos / BLOCK]) * block_stride +
+                       static_cast<size_t>(pos % BLOCK) * head_dim;
     for (int i = threadIdx.x; i < total; i += blockDim.x) {
         const int h = i / head_dim, d = i % head_dim;
-        kv[layer_k_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = kr[i];
-        kv[layer_v_stride + h * head_stride + static_cast<size_t>(pos) * head_dim + d] = vr[i];
+        kv[layer_k_stride + off + h * head_stride + d] = kr[i];
+        kv[layer_v_stride + off + h * head_stride + d] = vr[i];
     }
 }
 
@@ -336,8 +370,10 @@ __global__ void kv_store_rows(const float* k, const float* v, float* kv,
 // prefill is allclose- but not bitwise-equivalent to sequential steps.
 __global__ void attention_prefill(const float* q, const float* kv, float* att,
                                   size_t layer_k_stride, size_t layer_v_stride,
-                                  size_t head_stride, int n_head, int n_kv_head,
-                                  int head_dim, int pos_base, float scale) {
+                                  size_t block_stride, size_t head_stride,
+                                  int n_head, int n_kv_head,
+                                  int head_dim, const int* block_table, int pos_base,
+                                  float scale) {
     extern __shared__ float sm[];  // [T_max scores][128 reduction]
     float* scores = sm;
     float* red = sm + (pos_base + gridDim.x / n_head);  // upper bound T
@@ -345,8 +381,6 @@ __global__ void attention_prefill(const float* q, const float* kv, float* att,
     const int qh = blockIdx.x % n_head;
     const int kvh = qh / (n_head / n_kv_head);
     const float* q_h = q + (static_cast<size_t>(r) * n_head + qh) * head_dim;
-    const float* k_base = kv + layer_k_stride + kvh * head_stride;
-    const float* v_base = kv + layer_v_stride + kvh * head_stride;
     const int T = pos_base + r + 1;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -357,7 +391,9 @@ __global__ void attention_prefill(const float* q, const float* kv, float* att,
 #pragma unroll
     for (int i = 0; i < 4; ++i) qpart[i] = q_h[32 * i + lane];
     for (int t = warp; t < T; t += nwarp) {
-        const float* kk = k_base + static_cast<size_t>(t) * head_dim;
+        const float* kk = kv + layer_k_stride +
+                          static_cast<size_t>(block_table[t / BLOCK]) * block_stride +
+                          kvh * head_stride + static_cast<size_t>(t % BLOCK) * head_dim;
         float acc = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc += qpart[i] * kk[32 * i + lane];
@@ -394,8 +430,15 @@ __global__ void attention_prefill(const float* q, const float* kv, float* att,
     const int d = warp * 32 + lane;
     if (d < head_dim) {
         float acc = 0.0f;
-        for (int t = 0; t < T; ++t)
-            acc += scores[t] * inv * v_base[static_cast<size_t>(t) * head_dim + d];
+        for (int b = 0; b * BLOCK < T; ++b) {
+            const float* vb = kv + layer_v_stride +
+                              static_cast<size_t>(block_table[b]) * block_stride +
+                              kvh * head_stride;
+            const int lo = b * BLOCK;
+            const int jmax = (lo + BLOCK < T) ? BLOCK : (T - lo);
+            for (int j = 0; j < jmax; ++j)
+                acc += scores[lo + j] * inv * vb[static_cast<size_t>(j) * head_dim + d];
+        }
         att[(static_cast<size_t>(r) * n_head + qh) * head_dim + d] = acc;
     }
 }
@@ -440,12 +483,15 @@ __global__ void rope_batch(float* q, float* k, int n_q_head, int n_kv_head,
 // block per row: copy k/v row into slot slots[row] at position pos_arr[row]
 __global__ void kv_store_batch(const float* k, const float* v, float* kv,
                                size_t layer_k_stride, size_t layer_v_stride,
-                               size_t slot_stride, size_t head_stride,
+                               size_t block_stride, size_t head_stride,
                                int n_kv_head, int head_dim,
+                               const int* block_table, int max_blocks,
                                const int* pos_arr, const int* slot_arr) {
     const int row = blockIdx.x;
-    const size_t base = static_cast<size_t>(slot_arr[row]) * slot_stride +
-                        static_cast<size_t>(pos_arr[row]) * head_dim;
+    const int pos = pos_arr[row];
+    const int* bt = block_table + static_cast<size_t>(slot_arr[row]) * max_blocks;
+    const size_t base = static_cast<size_t>(bt[pos / BLOCK]) * block_stride +
+                        static_cast<size_t>(pos % BLOCK) * head_dim;
     const int total = n_kv_head * head_dim;
     const float* kr = k + static_cast<size_t>(row) * total;
     const float* vr = v + static_cast<size_t>(row) * total;
@@ -460,22 +506,25 @@ __global__ void kv_store_batch(const float* k, const float* v, float* kv,
 // kernel (same loop/reduction order -> bitwise per row)
 __global__ void attention_batch(const float* q, const float* kv, float* att, float* scores,
                                 size_t layer_k_stride, size_t layer_v_stride,
-                                size_t slot_stride, size_t head_stride,
+                                size_t block_stride, size_t head_stride,
                                 int n_head, int n_kv_head, int head_dim,
+                                const int* block_table, const int* nblk, int max_blocks,
                                 const int* pos_arr, const int* slot_arr, float scale,
                                 int scores_stride) {
     const int row = blockIdx.x / n_head, qh = blockIdx.x % n_head;
     const int pos = pos_arr[row];
     const int kvh = qh / (n_head / n_kv_head);
-    const size_t slot_base = static_cast<size_t>(slot_arr[row]) * slot_stride;
+    const int seq = slot_arr[row];
+    const int* bt = block_table + static_cast<size_t>(seq) * max_blocks;
+    const int nb = nblk[seq];   // device-side: keeps the CUDA graph valid
     const float* q_h = q + (static_cast<size_t>(row) * n_head + qh) * head_dim;
-    const float* k_base = kv + layer_k_stride + slot_base + kvh * head_stride;
-    const float* v_base = kv + layer_v_stride + slot_base + kvh * head_stride;
     scores += static_cast<size_t>(blockIdx.x) * scores_stride;
     const int T = pos + 1;
 
     for (int t = threadIdx.x; t < T; t += blockDim.x) {
-        const float* kk = k_base + static_cast<size_t>(t) * head_dim;
+        const float* kk = kv + layer_k_stride +
+                          static_cast<size_t>(bt[t / BLOCK]) * block_stride +
+                          kvh * head_stride + static_cast<size_t>(t % BLOCK) * head_dim;
         float acc = 0.0f;
         for (int i = 0; i < head_dim; ++i) acc += q_h[i] * kk[i];
         scores[t] = acc * scale;
@@ -507,8 +556,15 @@ __global__ void attention_batch(const float* q, const float* kv, float* att, flo
     const float inv = 1.0f / red[0];
     if (threadIdx.x < head_dim) {
         float acc = 0.0f;
-        for (int t = 0; t < T; ++t) {
-            acc += scores[t] * inv * v_base[static_cast<size_t>(t) * head_dim + threadIdx.x];
+        // 同单序列 kernel：块递增 → 块内位置递增，等价于原来的 for t=0..T。
+        for (int b = 0; b < nb; ++b) {
+            const float* vb = kv + layer_v_stride +
+                              static_cast<size_t>(bt[b]) * block_stride +
+                              kvh * head_stride;
+            const int lo = b * BLOCK;
+            const int jmax = (lo + BLOCK < T) ? BLOCK : (T - lo);
+            for (int j = 0; j < jmax; ++j)
+                acc += scores[lo + j] * inv * vb[static_cast<size_t>(j) * head_dim + threadIdx.x];
         }
         att[(static_cast<size_t>(row) * n_head + qh) * head_dim + threadIdx.x] = acc;
     }
@@ -654,7 +710,17 @@ struct GpuModel::Impl {
     // B8b slot pool + batch decode state
     int max_batch = 1;
     int n_slots = 1;                // max_batch>1 -> max_batch+1 (last = pad scratch)
-    size_t slot_stride = 0;         // n_kv_head * kv_cap * head_dim
+    size_t slot_stride = 0;         // legacy pre-B10 layout; kernels no longer use it
+    // ---- B10: paged KV ----
+    int max_blocks = 0;             // blocks per sequence = ceil(kv_cap / BLOCK)
+    int num_blocks = 0;             // pool size, in blocks
+    size_t block_stride = 0;        // n_kv_head * BLOCK * head_dim (elements per block)
+    int* d_block_table = nullptr;   // [n_slots][max_blocks], device
+    int* d_nblk = nullptr;          // [n_slots] valid block count, device
+    std::vector<int> h_block_table; // host mirror of d_block_table
+    std::vector<int> h_nblk;        // host mirror of d_nblk
+    std::vector<int> free_blocks;   // free stack (pop from back)
+    int used_blocks = 0;
     int *d_btok = nullptr, *d_bpos = nullptr, *d_bslot = nullptr;
     int32_t* d_next = nullptr;
     float* d_logitsm = nullptr;     // [max_batch][vocab]
@@ -672,6 +738,7 @@ struct GpuModel::Impl {
     ~Impl() {
         auto free_if = [](void* p) { if (p) cudaFree(p); };
         free_if(d_embd.p); free_if(d_out_norm); free_if(d_kv);
+        free_if(d_block_table); free_if(d_nblk);
         for (LayerDev& l : layers) {
             free_if(l.attn_norm); free_if(l.wq.p); free_if(l.wk.p); free_if(l.wv.p);
             free_if(l.q_norm); free_if(l.k_norm); free_if(l.wo.p);
@@ -721,16 +788,58 @@ struct GpuModel::Impl {
         }
     }
 
+    // ---- B10: block pool bookkeeping (host side) ----
+    // Ensures sequence `seq` owns blocks covering positions [0, upto).
+    // Blocks are handed out lazily as the sequence grows — that is the whole
+    // point of paging: a 100-token sequence no longer reserves kv_cap of KV.
+    // Returns false when the pool is exhausted.
+    bool ensure_blocks(int seq, int upto) {
+        if (upto <= 0) return true;
+        const int need = (upto + BLOCK - 1) / BLOCK;
+        if (need > max_blocks) fail("sequence exceeds kv_cap");
+        int& have = h_nblk[seq];
+        if (need <= have) return true;
+        while (have < need) {
+            if (free_blocks.empty()) return false;
+            h_block_table[static_cast<size_t>(seq) * max_blocks + have] = free_blocks.back();
+            free_blocks.pop_back();
+            ++have;
+            ++used_blocks;
+        }
+        // ⚠️ 这两个上传必须在 CUDA graph 捕获/重放**之前**发生。kernel 从显存读
+        //    块表与块数，图只固定指针与 launch 形状，所以内容更新不会让图失效。
+        CU_CHECK(cudaMemcpyAsync(d_nblk + seq, &h_nblk[seq], sizeof(int),
+                                 cudaMemcpyHostToDevice, stream));
+        CU_CHECK(cudaMemcpyAsync(d_block_table + static_cast<size_t>(seq) * max_blocks,
+                                 &h_block_table[static_cast<size_t>(seq) * max_blocks],
+                                 static_cast<size_t>(have) * sizeof(int),
+                                 cudaMemcpyHostToDevice, stream));
+        return true;
+    }
+
+    // Returns a slot's blocks to the pool. Called when a new sequence starts in
+    // that slot (prefill_batch with pos0 == 0); without it, a slot reused across
+    // requests would only ever grow its block count.
+    void release_slot_blocks(int seq) {
+        const int have = h_nblk[seq];
+        for (int b = 0; b < have; ++b)
+            free_blocks.push_back(h_block_table[static_cast<size_t>(seq) * max_blocks + b]);
+        used_blocks -= have;
+        h_nblk[seq] = 0;
+        CU_CHECK(cudaMemcpyAsync(d_nblk + seq, &h_nblk[seq], sizeof(int),
+                                 cudaMemcpyHostToDevice, stream));
+    }
+
     // One prefill chunk: rows 0..nr-1 of the multi-column buffers are sequence
     // positions pos_base..pos_base+nr-1. Bitwise-equivalent to nr sequential
     // single-token steps (see the B8a kernel block above).
     void prefill_chunk(int pos_base, int nr, int slot) {
         const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
         const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
-        const size_t layer_k_stride = static_cast<size_t>(n_slots) * slot_stride;
+        const size_t layer_k_stride = static_cast<size_t>(num_blocks) * block_stride;
         const size_t layer_v_stride = layer_k_stride;
-        const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
-        const size_t slot_off = static_cast<size_t>(slot) * slot_stride;
+        const size_t head_stride = static_cast<size_t>(BLOCK) * cfg.head_dim;
+        const int* bt = d_block_table + static_cast<size_t>(slot) * max_blocks;
 
         if (d_embd.type == 1) {
             embed_rows_f16<<<nr, 256, 0, stream>>>(static_cast<const __half*>(d_embd.p),
@@ -742,7 +851,7 @@ struct GpuModel::Impl {
 
         for (int l = 0; l < cfg.n_layer; ++l) {
             const LayerDev& w = layers[l];
-            const size_t lk = static_cast<size_t>(l) * 2 * layer_k_stride + slot_off;
+            const size_t lk = static_cast<size_t>(l) * 2 * layer_k_stride;
             const size_t lv = lk + layer_v_stride;
 
             rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, w.attn_norm, d_hm, H, cfg.rms_eps);
@@ -756,12 +865,13 @@ struct GpuModel::Impl {
             rope_rows<<<nr * (cfg.n_head + cfg.n_kv_head), cfg.head_dim / 2, 0, stream>>>(
                 d_qm, d_km, cfg.n_head, cfg.n_kv_head, cfg.head_dim, pos_base, cfg.rope_theta);
             kv_store_rows<<<nr, 256, 0, stream>>>(d_km, d_vm, d_kv, lk, lv,
-                                                  head_stride, cfg.n_kv_head, cfg.head_dim, pos_base);
+                                                  block_stride, head_stride, cfg.n_kv_head,
+                                                  cfg.head_dim, bt, pos_base);
             const int t_max = pos_base + nr;
             prof_begin(PH_ATTN);
             attention_prefill<<<nr * cfg.n_head, 128, (t_max + 128) * sizeof(float), stream>>>(
-                d_qm, d_kv, d_attm, lk, lv, head_stride, cfg.n_head, cfg.n_kv_head,
-                cfg.head_dim, pos_base, scale);
+                d_qm, d_kv, d_attm, lk, lv, block_stride, head_stride, cfg.n_head, cfg.n_kv_head,
+                cfg.head_dim, bt, pos_base, scale);
             prof_end(PH_ATTN);
             prof_begin(PH_GEMV); gemv_mc(w.wo, d_attm, d_ffnm, Q, H, nr); prof_end(PH_GEMV);
             add_many<<<(int)((static_cast<int64_t>(nr) * H + 255) / 256), 256, 0, stream>>>(
@@ -786,9 +896,9 @@ struct GpuModel::Impl {
         const int B = max_batch;
         const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
         const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
-        const size_t layer_k_stride = static_cast<size_t>(n_slots) * slot_stride;
+        const size_t layer_k_stride = static_cast<size_t>(num_blocks) * block_stride;
         const size_t layer_v_stride = layer_k_stride;
-        const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
+        const size_t head_stride = static_cast<size_t>(BLOCK) * cfg.head_dim;
 
         if (d_embd.type == 1) {
             embed_rows_f16<<<B, 256, 0, stream>>>(static_cast<const __half*>(d_embd.p),
@@ -813,12 +923,13 @@ struct GpuModel::Impl {
                                                                       cfg.rms_eps, cfg.n_kv_head);
             rope_batch<<<B * (cfg.n_head + cfg.n_kv_head), cfg.head_dim / 2, 0, stream>>>(
                 d_qm, d_km, cfg.n_head, cfg.n_kv_head, cfg.head_dim, d_bpos, cfg.rope_theta);
-            kv_store_batch<<<B, 256, 0, stream>>>(d_km, d_vm, d_kv, lk, lv, slot_stride,
+            kv_store_batch<<<B, 256, 0, stream>>>(d_km, d_vm, d_kv, lk, lv, block_stride,
                                                   head_stride, cfg.n_kv_head, cfg.head_dim,
-                                                  d_bpos, d_bslot);
+                                                  d_block_table, max_blocks, d_bpos, d_bslot);
             attention_batch<<<B * cfg.n_head, 128, 0, stream>>>(
-                d_qm, d_kv, d_attm, d_scores, lk, lv, slot_stride, head_stride,
-                cfg.n_head, cfg.n_kv_head, cfg.head_dim, d_bpos, d_bslot, scale, kv_cap);
+                d_qm, d_kv, d_attm, d_scores, lk, lv, block_stride, head_stride,
+                cfg.n_head, cfg.n_kv_head, cfg.head_dim, d_block_table, d_nblk, max_blocks,
+                d_bpos, d_bslot, scale, kv_cap);
             gemv_mc(w.wo, d_attm, d_ffnm, Q, H, B);
             add_many<<<(int)((static_cast<int64_t>(B) * H + 255) / 256), 256, 0, stream>>>(
                 d_xm, d_ffnm, static_cast<int64_t>(B) * H);
@@ -844,10 +955,11 @@ struct GpuModel::Impl {
     void step_kernels() {
         const int H = cfg.hidden, Q = cfg.n_head * cfg.head_dim, KV = cfg.n_kv_head * cfg.head_dim;
         const float scale = 1.0f / sqrtf(static_cast<float>(cfg.head_dim));
-        const size_t layer_k_stride = static_cast<size_t>(n_slots) * slot_stride;
+        const size_t layer_k_stride = static_cast<size_t>(num_blocks) * block_stride;
         const size_t layer_v_stride = layer_k_stride;
-        const size_t head_stride = static_cast<size_t>(kv_cap) * cfg.head_dim;
+        const size_t head_stride = static_cast<size_t>(BLOCK) * cfg.head_dim;
         const int* d_pos = d_step + 1;
+        const int* bt0 = d_block_table;   // single-sequence path always uses seq 0
 
         if (d_embd.type == 1) {
             embed_row<<<(H + 255) / 256, 256, 0, stream>>>(static_cast<const __half*>(d_embd.p),
@@ -870,11 +982,13 @@ struct GpuModel::Impl {
             rope_qk<<<cfg.n_head + cfg.n_kv_head, cfg.head_dim / 2, 0, stream>>>(
                 d_q, d_k, cfg.n_head, cfg.head_dim, d_pos, cfg.rope_theta);
             kv_store<<<(KV + 255) / 256, 256, 0, stream>>>(d_k, d_v, d_kv, lk, lv,
-                                                           head_stride, cfg.n_kv_head, cfg.head_dim, d_pos);
+                                                           block_stride, head_stride, cfg.n_kv_head,
+                                                           cfg.head_dim, bt0, d_pos);
             prof_begin(PH_ATTN);
             attention<<<cfg.n_head, 128, 0, stream>>>(d_q, d_kv, d_att, d_scores, lk, lv,
-                                                      head_stride, cfg.n_head, cfg.n_kv_head,
-                                                      cfg.head_dim, d_pos, scale, kv_cap);
+                                                      block_stride, head_stride, cfg.n_head,
+                                                      cfg.n_kv_head, cfg.head_dim, d_pos, scale,
+                                                      kv_cap, bt0, d_nblk);
             prof_end(PH_ATTN);
             prof_begin(PH_GEMV); gemv(w.wo, d_att, d_ffn, Q, H); prof_end(PH_GEMV);
             add_inplace<<<(H + 255) / 256, 256, 0, stream>>>(d_x, d_ffn, H);
@@ -945,7 +1059,7 @@ GpuModel::GpuModel(GpuModel&& o) noexcept : impl_(o.impl_) { o.impl_ = nullptr; 
 GpuModel::~GpuModel() { delete impl_; }
 const ModelConfig& GpuModel::config() const { return impl_->cfg; }
 
-GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch) {
+GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_blocks) {
     GpuModel gm;
     Impl* m = new Impl();
     gm.impl_ = m;
@@ -990,18 +1104,40 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch) {
         m->layers.push_back(w);
     }
 
-    const size_t kv_elems = static_cast<size_t>(c.n_layer) * 2 * c.n_kv_head * kv_cap * c.head_dim;
-    // B8b: slot pool. n_slots = max_batch+1 when batching (last slot is the
-    // padding scratch); shrink max_batch to fit 90% of free VRAM.
+    // ---- B10: paged KV pool ----
+    // A block holds BLOCK tokens of K and V for every KV head and layer. The
+    // pool replaces the old "one contiguous kv_cap region per slot" layout.
+    m->max_blocks = (kv_cap + BLOCK - 1) / BLOCK;
+    m->block_stride = static_cast<size_t>(c.n_kv_head) * BLOCK * c.head_dim;
+    const size_t block_bytes =
+        static_cast<size_t>(c.n_layer) * 2 * m->block_stride * sizeof(float);
+    // Worst case = every slot fills kv_cap. `num_blocks == 0` allocates exactly
+    // that, i.e. the pre-B10 footprint (so correctness is a like-for-like
+    // comparison); a smaller explicit value is where the VRAM saving comes from.
+    auto worst_case_blocks = [&](int mb) {
+        const int slots = mb > 1 ? mb + 1 : 1;
+        return static_cast<size_t>(slots) * static_cast<size_t>(m->max_blocks);
+    };
     if (max_batch < 1) fail("max_batch must be >= 1");
     if (max_batch > Impl::MAX_MC) max_batch = Impl::MAX_MC;
     size_t free_bytes = 0, total_bytes = 0;
     CU_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    while (max_batch > 1 && kv_elems * (max_batch + 1) * 4 > free_bytes * 9 / 10) max_batch >>= 1;
+    while (max_batch > 1 && worst_case_blocks(max_batch) * block_bytes > free_bytes * 9 / 10)
+        max_batch >>= 1;
     m->max_batch = max_batch;
     m->n_slots = max_batch > 1 ? max_batch + 1 : 1;
-    m->slot_stride = static_cast<size_t>(c.n_kv_head) * kv_cap * c.head_dim;
-    CU_CHECK(cudaMalloc(&m->d_kv, kv_elems * m->n_slots * sizeof(float)));
+    m->num_blocks = num_blocks > 0 ? num_blocks
+                                   : static_cast<int>(worst_case_blocks(max_batch));
+    m->slot_stride = static_cast<size_t>(c.n_kv_head) * kv_cap * c.head_dim;  // legacy
+    CU_CHECK(cudaMalloc(&m->d_kv, static_cast<size_t>(m->num_blocks) * block_bytes));
+    CU_CHECK(cudaMalloc(&m->d_block_table,
+                        static_cast<size_t>(m->n_slots) * m->max_blocks * sizeof(int)));
+    CU_CHECK(cudaMalloc(&m->d_nblk, static_cast<size_t>(m->n_slots) * sizeof(int)));
+    m->h_block_table.assign(static_cast<size_t>(m->n_slots) * m->max_blocks, 0);
+    m->h_nblk.assign(m->n_slots, 0);
+    CU_CHECK(cudaMemset(m->d_block_table, 0,
+                        static_cast<size_t>(m->n_slots) * m->max_blocks * sizeof(int)));
+    CU_CHECK(cudaMemset(m->d_nblk, 0, static_cast<size_t>(m->n_slots) * sizeof(int)));
     CU_CHECK(cudaMalloc(&m->d_x, H * 4));
     CU_CHECK(cudaMalloc(&m->d_h, H * 4));
     CU_CHECK(cudaMalloc(&m->d_q, Q * 4));
@@ -1017,6 +1153,8 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch) {
     CU_CHECK(cudaMalloc(&m->d_step, 2 * sizeof(int)));
     CU_CHECK(cudaMallocHost(&m->h_step, 2 * sizeof(int)));
     CU_CHECK(cudaStreamCreate(&m->stream));
+    m->free_blocks.resize(m->num_blocks);
+    for (int i = 0; i < m->num_blocks; ++i) m->free_blocks[i] = m->num_blocks - 1 - i;
     if (max_batch > 1) {
         // B8b batch-decode state
         CU_CHECK(cudaMalloc(&m->d_btok, max_batch * sizeof(int)));
@@ -1052,6 +1190,8 @@ void GpuModel::forward_logits(int32_t token, int pos, float* logits_out) {
     const ModelConfig& c = m->cfg;
     if (token < 0 || token >= c.vocab) fail("token out of range");
     if (pos < 0 || pos >= m->kv_cap) fail("position exceeds kv_cap");
+    // B10: make sure slot 0 owns a block covering `pos` (lazy growth).
+    if (!m->ensure_blocks(0, pos + 1)) fail("KV block pool exhausted (raise num_blocks)");
 
     m->h_step[0] = token;
     m->h_step[1] = pos;
@@ -1100,6 +1240,11 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
     const ModelConfig& c = m->cfg;
     if (n <= 0 || pos0 < 0 || pos0 + n > m->kv_cap) fail("prefill range out of kv_cap");
     if (slot < 0 || slot >= m->n_slots) fail("prefill slot out of range");
+    // B10: pos0 == 0 means "a new sequence starts in this slot" → return the
+    // previous sequence's blocks first, otherwise a slot reused across requests
+    // would only ever grow its block count.
+    if (pos0 == 0) m->release_slot_blocks(slot);
+    if (!m->ensure_blocks(slot, pos0 + n)) fail("KV block pool exhausted (raise num_blocks)");
     for (int base = 0; base < n; base += Impl::MAX_MC) {
         const int nr = std::min(static_cast<int>(Impl::MAX_MC), n - base);
         CU_CHECK(cudaMemcpyAsync(m->d_tokens, tokens + base, nr * sizeof(int),
@@ -1124,6 +1269,9 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
 }
 
 int GpuModel::max_batch() const { return impl_->max_batch; }
+int GpuModel::num_blocks() const { return impl_->num_blocks; }
+int GpuModel::used_blocks() const { return impl_->used_blocks; }
+int GpuModel::block_size() const { return BLOCK; }
 
 // B8b: one decode step for the padded batch. tokens/positions/slots are
 // max_batch-element host arrays; padding rows must use slot == max_batch
@@ -1133,6 +1281,11 @@ void GpuModel::decode_batch(const int32_t* tokens, const int* positions, const i
     Impl* m = impl_;
     const int B = m->max_batch;
     if (B <= 1) fail("decode_batch requires max_batch > 1");
+    // B10: cover every row — including the padding/scratch slot, whose KV store
+    // is real even though its attention output is discarded.
+    for (int i = 0; i < B; ++i)
+        if (!m->ensure_blocks(slots[i], positions[i] + 1))
+            fail("KV block pool exhausted (raise num_blocks)");
     for (int i = 0; i < B; ++i) {
         m->h_bstage[i] = tokens[i];
         m->h_bstage[B + i] = positions[i];

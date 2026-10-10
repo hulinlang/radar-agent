@@ -17,7 +17,11 @@ public:
     // max_batch > 1 enables the B8b slot pool: the KV cache becomes
     // [layer][k/v][slot][kv_head][kv_cap][head_dim] with max_batch+1 slots
     // (the extra slot is scratch for padded rows in batch decode).
-    static GpuModel load(const GGUFFile& f, int kv_cap, int max_batch = 1);
+    // B10 paged KV: `num_blocks` sizes the block pool. 0 = auto = the
+    // pre-B10 worst case (every slot may fill kv_cap), so correctness is
+    // directly comparable; pass a smaller value to trade capacity for VRAM.
+    static GpuModel load(const GGUFFile& f, int kv_cap, int max_batch = 1,
+                         int num_blocks = 0);
     ~GpuModel();
     GpuModel(const GpuModel&) = delete;
     GpuModel& operator=(const GpuModel&) = delete;
@@ -25,6 +29,9 @@ public:
 
     const ModelConfig& config() const;
     int max_batch() const;
+    int num_blocks() const;   // B10: block pool size
+    int used_blocks() const;  // B10: blocks currently handed out
+    int block_size() const;   // B10: tokens per block
 
     // Runs one token at absolute position pos; writes the vocab logits to
     // logits_out (host buffer, vocab floats).
