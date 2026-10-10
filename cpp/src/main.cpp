@@ -85,6 +85,21 @@ std::vector<int32_t> read_id_list(const std::string& path) {
     return ids;
 }
 
+#ifdef USE_CUDA
+// B10: one-line KV pool report. `worst` is what the pre-B10 layout would have
+// reserved (one contiguous kv_cap region per slot); `alloc` is what paging
+// actually allocates. The ratio is the memory win.
+void kv_pool_report(const ri::GpuModel& gpu, const char* mode) {
+    const double alloc = static_cast<double>(gpu.kv_bytes()) / 1048576.0;
+    const double worst = static_cast<double>(gpu.kv_worst_case_bytes()) / 1048576.0;
+    std::fprintf(stderr,
+                 "kv pool [B10/%s]: block=%d num_blocks=%d used=%d | allocated=%.1f MiB "
+                 "| pre-B10-equivalent=%.1f MiB | saved=%.1fx\n",
+                 mode, gpu.block_size(), gpu.num_blocks(), gpu.used_blocks(),
+                 alloc, worst, alloc > 0.0 ? worst / alloc : 0.0);
+}
+#endif
+
 using Clock = std::chrono::steady_clock;
 
 double secs(Clock::time_point a, Clock::time_point b) {
@@ -100,6 +115,7 @@ int main(int argc, char** argv) {
     int n_predict = 100;
     int kv_cap = 0;
     int max_batch = 8;
+    int num_blocks = 0;   // B10: 0 = auto (pre-B10 equivalent)
     bool batch_prefill = true;
     ri::Sampler sampler;
     std::vector<int32_t> bans;
@@ -124,6 +140,7 @@ int main(int argc, char** argv) {
         else if (a == "--n-predict") n_predict = std::stoi(need("--n-predict"));
         else if (a == "--kv-cap") kv_cap = std::stoi(need("--kv-cap"));
         else if (a == "--max-batch") max_batch = std::stoi(need("--max-batch"));
+        else if (a == "--num-blocks") num_blocks = std::stoi(need("--num-blocks"));
         else if (a == "--ids-out-prefix") ids_out_prefix = need("--ids-out-prefix");
         else if (a == "--ids-out") ids_out = need("--ids-out");
         else if (a == "--teacher-file") teacher_path = need("--teacher-file");
@@ -164,7 +181,8 @@ int main(int argc, char** argv) {
                 max_len = std::max(max_len,
                                    static_cast<int>(reqs[i].prompt.size()) + n_predict + 8);
             }
-            ri::GpuModel gpu = ri::GpuModel::load(f, max_len, max_batch);
+            ri::GpuModel gpu = ri::GpuModel::load(f, max_len, max_batch, num_blocks);
+            kv_pool_report(gpu, "batch");
             const int B = gpu.max_batch();
             if (B <= 1) throw std::runtime_error("max_batch degraded to 1 (VRAM); batch mode needs >1");
             std::fprintf(stderr, "batch mode: %zu requests, max_batch=%d, kv_cap=%d, eos=%d\n",
@@ -281,7 +299,8 @@ int main(int argc, char** argv) {
 
 #ifdef USE_CUDA
         if (use_cuda) {
-            ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap);
+            ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap, 1, num_blocks);
+            kv_pool_report(gpu, "single");
             const auto t0 = Clock::now();
             std::vector<float> logits(gpu.config().vocab);
             std::vector<float> scratch;
@@ -320,6 +339,9 @@ int main(int argc, char** argv) {
                 next = ri::sample_from(sampler, bans, logits.data(), logits.size(), scratch);
             }
             const auto t2 = Clock::now();
+            // B10a-4: snapshot AFTER the run — this is the number that shows the
+            // point of paging ("used 8 blocks while 256 were reserved").
+            kv_pool_report(gpu, "single-final");
             const double pre_s = secs(t0, t1), dec_s = secs(t1, t2);
             std::fprintf(stderr,
                          "prefill: %zu tokens in %.2fs (%.1f tok/s)\n"

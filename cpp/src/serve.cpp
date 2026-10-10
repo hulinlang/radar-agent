@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
     std::string model_path, host = "127.0.0.1";
     int port = 8090;
     int kv_cap = 4096;
+    int num_blocks = 0;   // B10: 0 = auto (pre-B10 equivalent)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* name) -> std::string {
@@ -168,6 +169,7 @@ int main(int argc, char** argv) {
         else if (a == "--port") port = std::stoi(need("--port"));
         else if (a == "--host") host = need("--host");
         else if (a == "--kv-cap") kv_cap = std::stoi(need("--kv-cap"));
+        else if (a == "--num-blocks") num_blocks = std::stoi(need("--num-blocks"));
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
     }
     if (model_path.empty()) fail("--model required");
@@ -175,7 +177,17 @@ int main(int argc, char** argv) {
     try {
         ri::GGUFFile f = ri::GGUFFile::open(model_path);
         ri::Tokenizer tok = ri::Tokenizer::from_gguf(f);
-        ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap, 1);
+        ri::GpuModel gpu = ri::GpuModel::load(f, kv_cap, 1, num_blocks);
+        std::fprintf(stderr,
+                     "kv pool [B10/serve]: block=%d num_blocks=%d used=%d | "
+                     "allocated=%.1f MiB | pre-B10-equivalent=%.1f MiB | saved=%.1fx\n",
+                     gpu.block_size(), gpu.num_blocks(), gpu.used_blocks(),
+                     static_cast<double>(gpu.kv_bytes()) / 1048576.0,
+                     static_cast<double>(gpu.kv_worst_case_bytes()) / 1048576.0,
+                     gpu.kv_bytes() > 0
+                         ? static_cast<double>(gpu.kv_worst_case_bytes()) /
+                               static_cast<double>(gpu.kv_bytes())
+                         : 0.0);
         std::vector<float> logits(gpu.config().vocab), scratch;
         std::fprintf(stderr, "radar-serve: model loaded (vocab=%d, kv_cap=%d), listening on %s:%d\n",
                      gpu.config().vocab, kv_cap, host.c_str(), port);

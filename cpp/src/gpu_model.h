@@ -32,6 +32,10 @@ public:
     int num_blocks() const;   // B10: block pool size
     int used_blocks() const;  // B10: blocks currently handed out
     int block_size() const;   // B10: tokens per block
+    // B10: actual KV pool bytes, and what the pre-B10 layout (one contiguous
+    // kv_cap region per slot) would have reserved — the difference is the win.
+    size_t kv_bytes() const;
+    size_t kv_worst_case_bytes() const;
 
     // Runs one token at absolute position pos; writes the vocab logits to
     // logits_out (host buffer, vocab floats).

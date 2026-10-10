@@ -1129,7 +1129,19 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     m->num_blocks = num_blocks > 0 ? num_blocks
                                    : static_cast<int>(worst_case_blocks(max_batch));
     m->slot_stride = static_cast<size_t>(c.n_kv_head) * kv_cap * c.head_dim;  // legacy
+    // RADAR_MEM_REPORT=1: print the computed pool size next to the allocator's
+    // own delta — two independent sources for the same number (§5.8).
+    size_t kv_free0 = 0, kv_total0 = 0;
+    if (std::getenv("RADAR_MEM_REPORT")) CU_CHECK(cudaMemGetInfo(&kv_free0, &kv_total0));
     CU_CHECK(cudaMalloc(&m->d_kv, static_cast<size_t>(m->num_blocks) * block_bytes));
+    if (std::getenv("RADAR_MEM_REPORT")) {
+        size_t kv_free1 = 0, kv_total1 = 0;
+        CU_CHECK(cudaMemGetInfo(&kv_free1, &kv_total1));
+        std::fprintf(stderr,
+                     "kv mem [B10]: computed=%.1f MiB | measured cudaMemGetInfo delta=%.1f MiB\n",
+                     static_cast<double>(m->num_blocks) * static_cast<double>(block_bytes) / 1048576.0,
+                     static_cast<double>(kv_free0 - kv_free1) / 1048576.0);
+    }
     CU_CHECK(cudaMalloc(&m->d_block_table,
                         static_cast<size_t>(m->n_slots) * m->max_blocks * sizeof(int)));
     CU_CHECK(cudaMalloc(&m->d_nblk, static_cast<size_t>(m->n_slots) * sizeof(int)));
@@ -1272,6 +1284,16 @@ int GpuModel::max_batch() const { return impl_->max_batch; }
 int GpuModel::num_blocks() const { return impl_->num_blocks; }
 int GpuModel::used_blocks() const { return impl_->used_blocks; }
 int GpuModel::block_size() const { return BLOCK; }
+
+size_t GpuModel::kv_bytes() const {
+    return static_cast<size_t>(impl_->num_blocks) * impl_->block_stride * 2 *
+           impl_->cfg.n_layer * sizeof(float);
+}
+
+size_t GpuModel::kv_worst_case_bytes() const {
+    return static_cast<size_t>(impl_->n_slots) * static_cast<size_t>(impl_->max_blocks) *
+           impl_->block_stride * 2 * impl_->cfg.n_layer * sizeof(float);
+}
 
 // B8b: one decode step for the padded batch. tokens/positions/slots are
 // max_batch-element host arrays; padding rows must use slot == max_batch
