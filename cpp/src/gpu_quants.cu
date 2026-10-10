@@ -281,6 +281,115 @@ __global__ void gemv_q6k_mc_kernel(const uint8_t* w, const float* x, float* y,
     }
 }
 
+// ---------------- B11: int8 activations x Q4_K (prefill only) ----------------
+//
+// Why this shape (docs/34 section 3.3): the fp32 route is *instruction-issue*
+// bound -- 256 nibbles per super-block each need a shift/and/scale/multiply --
+// and P11 measured it flat at ~16% of the compute roof on three prompt lengths
+// (length-independent => not a memory problem). dp4a retires 4 int8 MACs per
+// instruction, and the int32 dot products let the fp32 part collapse to two
+// terms per sub-block instead of eight per value.
+//
+// Warp tile: lane = (row, column) with column fastest, so 32 lanes cover
+// ROWS_PER_WARP rows x 16 columns of a prefill chunk. Each lane owns ONE output
+// element and walks the whole k dimension by itself. That has three properties
+// this stage needs:
+//   * no shared memory and no cross-lane reduction at all (SM89 shuffles run at
+//     ~1/4 of FMA throughput, so a per-column reduction would eat the win);
+//   * the weight loads inside a warp are per-row distinct addresses, so 16 lanes
+//     broadcast one 128-byte line -- DRAM traffic stays 1x the weight size;
+//   * the fp32 accumulation order is exactly the reference's (ascending
+//     super-block, ascending sub-block), which is what makes layer 1 of the
+//     cross-check bit-exact instead of "close".
+__global__ void quantize_q8_1_kernel(const float* __restrict__ x,
+                                     int8_t* __restrict__ qs,
+                                     Q8_1Ds* __restrict__ ds,
+                                     int k, int total_groups) {
+    const int lane = threadIdx.x & 31;
+    const int warp = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (warp >= total_groups) return;
+    const int groups_per_col = k >> 5;
+    const int c = warp / groups_per_col;
+    const int g = warp - c * groups_per_col;
+
+    const float xv = x[static_cast<size_t>(c) * k + static_cast<size_t>(g) * 32 + lane];
+    float amax = fabsf(xv);
+#pragma unroll
+    for (int off = 16; off; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+
+    // Same as llama.cpp CUDA quantize_q8_1: quantize with the fp32 scale,
+    // store/use the fp16 one.
+    const float d32 = amax / 127.0f;
+    int q = 0;
+    if (d32 != 0.0f) q = static_cast<int>(roundf(xv / d32));   // roundf = half away from zero
+    qs[static_cast<size_t>(c) * k + static_cast<size_t>(g) * 32 + lane] = static_cast<int8_t>(q);
+    if (lane == 0) {
+        ds[static_cast<size_t>(c) * groups_per_col + g].sum_q = __reduce_add_sync(0xffffffffu, q);
+        ds[static_cast<size_t>(c) * groups_per_col + g].d = __half2float(__float2half_rn(d32));
+    }
+}
+
+template <int RW, int NC>
+__global__ void gemv_q4k_q8_1_kernel(const uint8_t* __restrict__ w,
+                                     const int8_t* __restrict__ qs,
+                                     const Q8_1Ds* __restrict__ ds,
+                                     float* __restrict__ y, int in, int out) {
+    const int lane = threadIdx.x & 31;
+    const int r_local = lane / NC;
+    const int c = lane - r_local * NC;
+    const int row = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RW + r_local;
+    if (row >= out) return;
+
+    const int nb = in / QK_K;
+    const uint8_t* wr = w + static_cast<size_t>(row) * nb * Q4K_BLOCK_BYTES;
+    const int8_t* qc = qs + static_cast<size_t>(c) * in;
+    const Q8_1Ds* dc = ds + static_cast<size_t>(c) * nb * 8;
+
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* sb = wr + static_cast<size_t>(b) * Q4K_BLOCK_BYTES;
+        const float d4 = __half2float(*reinterpret_cast<const __half*>(sb));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
+        float sd = 0.0f, sm = 0.0f;
+        // One 32-byte qs group serves sub-blocks 2g (low nibbles) and 2g+1
+        // (high nibbles): 2 x uint4 weight loads for 64 values.
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const uint4 w0 = *reinterpret_cast<const uint4*>(sb + 16 + g * 32);
+            const uint4 w1 = *reinterpret_cast<const uint4*>(sb + 16 + g * 32 + 16);
+            const int8_t* a0 = qc + (b * 8 + 2 * g) * 32;
+            const int8_t* a1 = a0 + 32;
+            const uint4 x0 = *reinterpret_cast<const uint4*>(a0);
+            const uint4 x1 = *reinterpret_cast<const uint4*>(a0 + 16);
+            const uint4 x2 = *reinterpret_cast<const uint4*>(a1);
+            const uint4 x3 = *reinterpret_cast<const uint4*>(a1 + 16);
+            const uint32_t wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            const uint32_t av0[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            const uint32_t av1[8] = {x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
+            int dot_lo = 0, dot_hi = 0;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                dot_lo = __dp4a(static_cast<int>(wv[q] & 0x0F0F0F0Fu), static_cast<int>(av0[q]), dot_lo);
+                dot_hi = __dp4a(static_cast<int>((wv[q] >> 4) & 0x0F0F0F0Fu), static_cast<int>(av1[q]), dot_hi);
+            }
+            uint8_t sc, m;
+            detail::get_scale_min_k4(2 * g, sb + 4, &sc, &m);
+            const float dlo = dc[b * 8 + 2 * g].d;
+            sd = __fadd_rn(sd, __fmul_rn(dlo, static_cast<float>(dot_lo * static_cast<int>(sc))));
+            sm = __fadd_rn(sm, __fmul_rn(dlo, static_cast<float>(dc[b * 8 + 2 * g].sum_q * static_cast<int>(m))));
+            detail::get_scale_min_k4(2 * g + 1, sb + 4, &sc, &m);
+            const float dhi = dc[b * 8 + 2 * g + 1].d;
+            sd = __fadd_rn(sd, __fmul_rn(dhi, static_cast<float>(dot_hi * static_cast<int>(sc))));
+            sm = __fadd_rn(sm, __fmul_rn(dhi, static_cast<float>(dc[b * 8 + 2 * g + 1].sum_q * static_cast<int>(m))));
+        }
+        // __fmul_rn/__fadd_rn everywhere: -fmad=true is the nvcc default and FMA
+        // contraction would change the last bit, breaking the bit-exact criterion.
+        const float part = __fsub_rn(__fmul_rn(d4, sd), __fmul_rn(dmin, sm));
+        acc = __fadd_rn(acc, part);
+    }
+    y[static_cast<size_t>(c) * out + row] = acc;
+}
+
 __global__ void embed_row_q6k_kernel(const uint8_t* embd, float* x,
                                      const int* token_p, int hidden) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -326,6 +435,27 @@ void gemv_q6k_mc(const uint8_t* w, const float* x, float* y, int in, int out,
 void embed_row_q6k(const uint8_t* embd, float* x, const int* token_p, int hidden,
                    cudaStream_t stream) {
     embed_row_q6k_kernel<<<(hidden + 255) / 256, 256, 0, stream>>>(embd, x, token_p, hidden);
+}
+
+void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
+                   cudaStream_t stream) {
+    const int groups = k >> 5;
+    const int total = ncol * groups;
+    constexpr int WARPS_PER_BLOCK = 4;
+    const int blocks = (total + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    quantize_q8_1_kernel<<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(x, qs, ds, k, total);
+}
+
+void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                   int in, int out, int ncol, cudaStream_t stream) {
+    // Fixed 2-row x 16-column tile: the prefill chunk width (MAX_MC) is 16, so
+    // shorter chunks just waste some lanes (padding columns are computed and
+    // dropped by the caller). ncol is accepted for the API's sake only.
+    (void)ncol;
+    constexpr int RW = 2, NC = 16;
+    const int rows_per_block = RW * 4;
+    gemv_q4k_q8_1_kernel<RW, NC>
+        <<<(out + rows_per_block - 1) / rows_per_block, 128, 0, stream>>>(w, qs, ds, y, in, out);
 }
 
 void dequant_q4k(const uint8_t* w, float* y, int64_t n) {

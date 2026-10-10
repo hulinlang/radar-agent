@@ -118,7 +118,7 @@
 > 「22 题 vs llama-server **Δ=+0.0000**」是在 Q4 上测的。改了 prefill 数值口径后**必须重测**，
 > 并如实报出新的 Δ（预期不再是 0.0000）。**这是 D4 的一部分，不是回归失败。**
 
-### 3.2 数值方案（**待你拍板**，因为它决定 D2 能到多少）
+### 3.2 数值方案（**已定：B**，2026-10-10 确认）
 
 三种候选，差别在"激活怎么量化"：
 
@@ -131,6 +131,61 @@
 **推荐 B**：`docs/28` §6.3 的整段分析都建立在"与我们对比的 llama.cpp 是同一条 Q4_K×Q8_1 路线"上，
 选 B 才能让 D2 的"一致率应上升"成为一个**干净的可证伪判据**；选 A/C 则一致率的变化会被
 "块大小不同"这个额外变量污染。
+
+#### 3.2.1 方案 B 的确切语义（实现前先钉死，D1 层①对拍的就是它）
+
+激活量化**逐 32 个连续值一组**，与 llama.cpp CUDA 的 `quantize_q8_1` 逐句对齐
+（`ggml/src/ggml-cuda/quantize.cu:54`）：
+
+```
+amax = max_l |x_l|                         (fp32)
+d32  = amax / 127.0f                       (fp32)
+q_l  = (amax == 0) ? 0 : roundf(x_l / d32) (int8, round-half-away-from-zero)
+d    = float(half(d32))                    ← 下游实际使用的 d
+Σq   = Σ_l q_l                             (int32, 精确)
+```
+
+⚠️ **复刻一处 llama.cpp 的固有细节**：llama.cpp **用 fp32 的 `d32` 去量化**，
+但**存进 block 的 `d` 是 fp16**，而 dot 里用的是**那个 fp16 的 `d`**。
+我们照做 —— 这正是"对齐 Q8_1"的含义；换成全程 fp32 的 `d` 会更准但会偏离参照。
+
+激活块布局（本项目的定义，**不**照抄 llama.cpp 的 36 B 布局）：
+
+```c
+struct BlockQ8_1 {   // 40 B, 4 字节对齐
+    float   d;       // = float(half(amax/127))，dot 里实际用的缩放
+    int32_t sum_q;   // = Σ q_l，精确整数
+    int8_t  qs[32];
+};
+```
+
+> 为什么用 `int32 sum_q` 而不是 llama.cpp 的 `half s`：mmvq 路径的 offset 项本来就是用
+> **dp4a 现算** `Σq`（`0x01010101` 与被量化的激活做 dp4a，见 `vecdotq.cuh:520`），
+> 所以存精确整数**与参照同值**，还省掉 kernel 里的一次 warp 归约。
+
+权重侧的贡献式（Q4_K，逐 super-block、逐 sub-block，`j` 升序）：
+
+```
+sumf_d_b = Σ_j  f32(d8[b*8+j]) * f32(dot1_j * sc_j)      // dot1_j = Σ_l nib_l*q_l (int32)
+sumf_m_b = Σ_j  f32(d8[b*8+j]) * f32(dot2_j * m_j)       // dot2_j = Σ_l q_l = sum_q (int32)
+part_b   = f32(d4) * sumf_d_b - f32(dmin) * sumf_m_b
+y        = Σ_b part_b                                     // b 升序累加
+```
+
+Q6_K 同构，只是"scale 组"是 **16 个值**（`sc` 为 int8，`q ∈ [-32,31]`）：
+
+```
+sumf_b = Σ_g f32(d8[block(g)]) * f32(sc_g * dot_g)       // dot_g = Σ_{16} q6_l*q8_l
+part_b = f32(d6) * sumf_b
+y      = Σ_b part_b
+```
+
+**浮点运算一律显式 round-to-nearest 的"先乘后加"**（CUDA 侧用 `__fmul_rn`/`__fadd_rn`
+禁止 FMA 收缩），这样 NumPy 的 `a*b + c`（float32）能与之**逐位一致** —— B5 的
+3.3 亿值逐位 EXACT 就是这么做的。
+
+**累加顺序即判据**：NumPy 参考与 kernel 必须用**同一个括号化**；D1 要求逐位相等，
+"顺序不同所以差一点"不被接受（否则层①就失去了定位能力）。
 
 ### 3.3 kernel 形态
 

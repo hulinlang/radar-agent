@@ -29,6 +29,16 @@ add_executable(tokenizer-test src/gguf.cpp src/tokenizer.cpp src/tokenizer_test.
 # B9a：host 采样器单元测试（纯 CPU，无模型依赖）
 add_executable(sampler-test tests/sampler_test.cpp)
 
+# B11：int8 激活（Q8_1 对齐）× Q4_K/Q6_K 的 host 参考实现 + 层①对拍
+#   ⚠️ -ffp-contract=off 是**语义要求**而非优化选项：B11 的浮点括号化是规格的
+#   一部分（docs/34 §3.2.1），GCC 默认 -ffp-contract=fast 会把 a*b+c 收缩成 FMA，
+#   从而与 NumPy 参考（和 CUDA 侧的 __fmul_rn/__fadd_rn）产生最后一位差异。
+add_executable(int8-ref-test src/gguf.cpp src/int8_act.cpp tests/int8_ref_test.cpp)
+target_include_directories(int8-ref-test PRIVATE src)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/int8_act.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
 # B3：CPU 前向（语义基准）+ 逐层对拍
 add_executable(forward-test src/gguf.cpp src/ops.cpp src/quants.cpp src/simd_avx2.cpp src/model.cpp src/forward_test.cpp)
 
@@ -76,6 +86,14 @@ if(CMAKE_CUDA_COMPILER)
   add_executable(gemv-bench src/gguf.cpp tests/gemv_bench.cpp)
   target_include_directories(gemv-bench PRIVATE src)
   target_link_libraries(gemv-bench PRIVATE radar_gpu CUDA::cudart)
+# B11：层①对拍的 CUDA 半边（同一份参考文件，逐元素 bit-exact）
+  add_executable(int8-ref-test-cuda src/gguf.cpp src/int8_act.cpp tests/int8_ref_test.cpp)
+  target_include_directories(int8-ref-test-cuda PRIVATE src)
+  target_compile_definitions(int8-ref-test-cuda PRIVATE USE_CUDA)
+  target_link_libraries(int8-ref-test-cuda PRIVATE radar_gpu CUDA::cudart)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/int8_act.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  endif()
   message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (cuda backend enabled, sm_89)")
 else()
   message(STATUS "CUDA not found (cuda backend disabled)")
