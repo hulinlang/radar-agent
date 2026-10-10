@@ -304,7 +304,7 @@ __global__ void gemv_q6k_mc_kernel(const uint8_t* w, const float* x, float* y,
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x,
                                      int8_t* __restrict__ qs,
                                      Q8_1Ds* __restrict__ ds,
-                                     int k, int total_groups) {
+                                     int k, int ncols, int total_groups) {
     const int lane = threadIdx.x & 31;
     const int warp = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (warp >= total_groups) return;
@@ -322,72 +322,104 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x,
     const float d32 = amax / 127.0f;
     int q = 0;
     if (d32 != 0.0f) q = static_cast<int>(roundf(xv / d32));   // roundf = half away from zero
-    qs[static_cast<size_t>(c) * k + static_cast<size_t>(g) * 32 + lane] = static_cast<int8_t>(q);
+    // ⚠️ __reduce_add_sync is a *collective*: every lane in the mask must execute
+    // it. Calling it inside `if (lane == 0)` is undefined behaviour and silently
+    // returned garbage sums -- which is exactly the Q4_K offset term, so the
+    // whole prefill decoded to nonsense (B11 D2: teacher-agreement 0/50).
+    // The layer-1 test missed it because it fed the kernel host-quantized
+    // activations; it now checks the CUDA quantizer output byte-for-byte too.
+    const int sum = __reduce_add_sync(0xffffffffu, q);
+    // Block-major layout [k/32][ncol][32]: all columns' data for one 32-value
+    // block is contiguous. With a column-major [ncol][k] layout the gemv below
+    // would touch one 128-byte line per column per load -> 16 lines per warp
+    // load and a 2.4x net SLOWDOWN vs the fp32 route (measured, see docs/34 §7).
+    qs[static_cast<size_t>(g) * ncols * 32 + static_cast<size_t>(c) * 32 + lane] =
+        static_cast<int8_t>(q);
     if (lane == 0) {
-        ds[static_cast<size_t>(c) * groups_per_col + g].sum_q = __reduce_add_sync(0xffffffffu, q);
-        ds[static_cast<size_t>(c) * groups_per_col + g].d = __half2float(__float2half_rn(d32));
+        ds[static_cast<size_t>(g) * ncols + c].sum_q = sum;
+        ds[static_cast<size_t>(g) * ncols + c].d = __half2float(__float2half_rn(d32));
     }
 }
 
-template <int RW, int NC>
+// Tile = RW rows x NC columns per warp, looping over the LC = 16 allocated
+// columns in groups of NC. The choice is purely a memory-shape tradeoff:
+//
+//   L1 bytes per output per super-block  ~  4/(NC*256) [weights re-read per
+//   column group]  +  1/RW  [activation reuse across rows]
+//
+// and the MAC cost per lane is identical for every tile (each lane owns one
+// (row, column) output and walks the whole k). So the tile does NOT change the
+// arithmetic -- only which addresses a warp touches -- and bit-exactness of the
+// accumulation order is preserved for all of them. B11 measured the sweep
+// (see cpp/tests/gemv_bench.cpp int8 mode): see docs/34 §7.
+template <int RW, int NC, int LC>
 __global__ void gemv_q4k_q8_1_kernel(const uint8_t* __restrict__ w,
                                      const int8_t* __restrict__ qs,
                                      const Q8_1Ds* __restrict__ ds,
                                      float* __restrict__ y, int in, int out) {
     const int lane = threadIdx.x & 31;
     const int r_local = lane / NC;
-    const int c = lane - r_local * NC;
+    const int c_in = lane - r_local * NC;
     const int row = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * RW + r_local;
     if (row >= out) return;
 
     const int nb = in / QK_K;
     const uint8_t* wr = w + static_cast<size_t>(row) * nb * Q4K_BLOCK_BYTES;
-    const int8_t* qc = qs + static_cast<size_t>(c) * in;
-    const Q8_1Ds* dc = ds + static_cast<size_t>(c) * nb * 8;
 
-    float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) {
-        const uint8_t* sb = wr + static_cast<size_t>(b) * Q4K_BLOCK_BYTES;
-        const float d4 = __half2float(*reinterpret_cast<const __half*>(sb));
-        const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
-        float sd = 0.0f, sm = 0.0f;
-        // One 32-byte qs group serves sub-blocks 2g (low nibbles) and 2g+1
-        // (high nibbles): 2 x uint4 weight loads for 64 values.
 #pragma unroll
-        for (int g = 0; g < 4; ++g) {
-            const uint4 w0 = *reinterpret_cast<const uint4*>(sb + 16 + g * 32);
-            const uint4 w1 = *reinterpret_cast<const uint4*>(sb + 16 + g * 32 + 16);
-            const int8_t* a0 = qc + (b * 8 + 2 * g) * 32;
-            const int8_t* a1 = a0 + 32;
-            const uint4 x0 = *reinterpret_cast<const uint4*>(a0);
-            const uint4 x1 = *reinterpret_cast<const uint4*>(a0 + 16);
-            const uint4 x2 = *reinterpret_cast<const uint4*>(a1);
-            const uint4 x3 = *reinterpret_cast<const uint4*>(a1 + 16);
-            const uint32_t wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
-            const uint32_t av0[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-            const uint32_t av1[8] = {x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
-            int dot_lo = 0, dot_hi = 0;
+    for (int c0 = 0; c0 < LC; c0 += NC) {
+        const int c = c0 + c_in;
+        // Activation layout is [k/32][LC][32]: one block's columns are contiguous.
+        const int8_t* qc = qs + static_cast<size_t>(c) * 32;
+        const Q8_1Ds* dc = ds + c;
+        float acc = 0.0f;
+
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* sb = wr + static_cast<size_t>(b) * Q4K_BLOCK_BYTES;
+            const float d4 = __half2float(*reinterpret_cast<const __half*>(sb));
+            const float dmin = __half2float(*reinterpret_cast<const __half*>(sb + 2));
+            float sd = 0.0f, sm = 0.0f;
+            // One 32-byte qs group serves sub-blocks 2g (low nibbles) and 2g+1
+            // (high nibbles): 2 x uint4 weight loads for 64 values.
 #pragma unroll
-            for (int q = 0; q < 8; ++q) {
-                dot_lo = __dp4a(static_cast<int>(wv[q] & 0x0F0F0F0Fu), static_cast<int>(av0[q]), dot_lo);
-                dot_hi = __dp4a(static_cast<int>((wv[q] >> 4) & 0x0F0F0F0Fu), static_cast<int>(av1[q]), dot_hi);
+            for (int g = 0; g < 4; ++g) {
+                const uint4 w0 = *reinterpret_cast<const uint4*>(sb + 16 + g * 32);
+                const uint4 w1 = *reinterpret_cast<const uint4*>(sb + 16 + g * 32 + 16);
+                const int8_t* a0 = qc + static_cast<size_t>(b * 8 + 2 * g) * LC * 32;
+                const int8_t* a1 = a0 + static_cast<size_t>(LC) * 32;
+                const uint4 x0 = *reinterpret_cast<const uint4*>(a0);
+                const uint4 x1 = *reinterpret_cast<const uint4*>(a0 + 16);
+                const uint4 x2 = *reinterpret_cast<const uint4*>(a1);
+                const uint4 x3 = *reinterpret_cast<const uint4*>(a1 + 16);
+                const uint32_t wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+                const uint32_t av0[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+                const uint32_t av1[8] = {x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w};
+                int dot_lo = 0, dot_hi = 0;
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    dot_lo = __dp4a(static_cast<int>(wv[q] & 0x0F0F0F0Fu), static_cast<int>(av0[q]), dot_lo);
+                    dot_hi = __dp4a(static_cast<int>((wv[q] >> 4) & 0x0F0F0F0Fu), static_cast<int>(av1[q]), dot_hi);
+                }
+                uint8_t sc, m;
+                detail::get_scale_min_k4(2 * g, sb + 4, &sc, &m);
+                const float dlo = dc[static_cast<size_t>(b * 8 + 2 * g) * LC].d;
+                sd = __fadd_rn(sd, __fmul_rn(dlo, static_cast<float>(dot_lo * static_cast<int>(sc))));
+                sm = __fadd_rn(sm, __fmul_rn(dlo, static_cast<float>(
+                    dc[static_cast<size_t>(b * 8 + 2 * g) * LC].sum_q * static_cast<int>(m))));
+                detail::get_scale_min_k4(2 * g + 1, sb + 4, &sc, &m);
+                const float dhi = dc[static_cast<size_t>(b * 8 + 2 * g + 1) * LC].d;
+                sd = __fadd_rn(sd, __fmul_rn(dhi, static_cast<float>(dot_hi * static_cast<int>(sc))));
+                sm = __fadd_rn(sm, __fmul_rn(dhi, static_cast<float>(
+                    dc[static_cast<size_t>(b * 8 + 2 * g + 1) * LC].sum_q * static_cast<int>(m))));
             }
-            uint8_t sc, m;
-            detail::get_scale_min_k4(2 * g, sb + 4, &sc, &m);
-            const float dlo = dc[b * 8 + 2 * g].d;
-            sd = __fadd_rn(sd, __fmul_rn(dlo, static_cast<float>(dot_lo * static_cast<int>(sc))));
-            sm = __fadd_rn(sm, __fmul_rn(dlo, static_cast<float>(dc[b * 8 + 2 * g].sum_q * static_cast<int>(m))));
-            detail::get_scale_min_k4(2 * g + 1, sb + 4, &sc, &m);
-            const float dhi = dc[b * 8 + 2 * g + 1].d;
-            sd = __fadd_rn(sd, __fmul_rn(dhi, static_cast<float>(dot_hi * static_cast<int>(sc))));
-            sm = __fadd_rn(sm, __fmul_rn(dhi, static_cast<float>(dc[b * 8 + 2 * g + 1].sum_q * static_cast<int>(m))));
+            // __fmul_rn/__fadd_rn everywhere: -fmad=true is the nvcc default and
+            // FMA contraction would change the last bit, breaking the bit-exact
+            // criterion of the layer-1 cross-check.
+            const float part = __fsub_rn(__fmul_rn(d4, sd), __fmul_rn(dmin, sm));
+            acc = __fadd_rn(acc, part);
         }
-        // __fmul_rn/__fadd_rn everywhere: -fmad=true is the nvcc default and FMA
-        // contraction would change the last bit, breaking the bit-exact criterion.
-        const float part = __fsub_rn(__fmul_rn(d4, sd), __fmul_rn(dmin, sm));
-        acc = __fadd_rn(acc, part);
+        y[static_cast<size_t>(c) * out + row] = acc;
     }
-    y[static_cast<size_t>(c) * out + row] = acc;
 }
 
 __global__ void embed_row_q6k_kernel(const uint8_t* embd, float* x,
@@ -443,19 +475,52 @@ void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
     const int total = ncol * groups;
     constexpr int WARPS_PER_BLOCK = 4;
     const int blocks = (total + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    quantize_q8_1_kernel<<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(x, qs, ds, k, total);
+    quantize_q8_1_kernel<<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(x, qs, ds, k, ncol, total);
 }
 
 void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                    int in, int out, int ncol, cudaStream_t stream) {
-    // Fixed 2-row x 16-column tile: the prefill chunk width (MAX_MC) is 16, so
-    // shorter chunks just waste some lanes (padding columns are computed and
-    // dropped by the caller). ncol is accepted for the API's sake only.
-    (void)ncol;
-    constexpr int RW = 2, NC = 16;
-    const int rows_per_block = RW * 4;
-    gemv_q4k_q8_1_kernel<RW, NC>
-        <<<(out + rows_per_block - 1) / rows_per_block, 128, 0, stream>>>(w, qs, ds, y, in, out);
+    // ⚠️ The tile is chosen from the END-TO-END paired measurement, not from the
+    // isolated bench: gemv-bench calls the same 7 MB matrix 200 times in a row,
+    // so it runs L2-resident, while the engine streams ~900 MB per chunk with no
+    // reuse. The two disagree (bench prefers 4x8 for the wide shapes; the engine
+    // measures 8x4 faster), and only the engine number is real.
+    gemv_q4k_q8_1_tile(w, qs, ds, y, in, out, ncol, B11_TILE_RW, B11_TILE_NC, stream);
+}
+
+void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                        int in, int out, int ncol, int rw, int nc, cudaStream_t stream) {
+    (void)ncol;   // the activation layout always carries LC = 16 columns
+    constexpr int LC = 16;
+    constexpr int WPB = 4;   // warps per block
+    // rows_per_block = RW * WPB, so the grid is ceil(out / (RW * 4)).
+    switch (rw * 100 + nc) {
+        case 2 * 100 + 16:
+            gemv_q4k_q8_1_kernel<2, 16, LC>
+                <<<(out + 2 * WPB - 1) / (2 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+            break;
+        case 4 * 100 + 8:
+            gemv_q4k_q8_1_kernel<4, 8, LC>
+                <<<(out + 4 * WPB - 1) / (4 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+            break;
+        case 8 * 100 + 4:
+            gemv_q4k_q8_1_kernel<8, 4, LC>
+                <<<(out + 8 * WPB - 1) / (8 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+            break;
+        case 16 * 100 + 2:
+            gemv_q4k_q8_1_kernel<16, 2, LC>
+                <<<(out + 16 * WPB - 1) / (16 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+            break;
+        case 32 * 100 + 1:
+            gemv_q4k_q8_1_kernel<32, 1, LC>
+                <<<(out + 32 * WPB - 1) / (32 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+            break;
+        default:
+            gemv_q4k_q8_1_kernel<B11_TILE_RW, B11_TILE_NC, LC>
+                <<<(out + B11_TILE_RW * WPB - 1) / (B11_TILE_RW * WPB), 128, 0, stream>>>(
+                    w, qs, ds, y, in, out);
+            break;
+    }
 }
 
 void dequant_q4k(const uint8_t* w, float* y, int64_t n) {

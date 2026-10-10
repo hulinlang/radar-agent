@@ -78,8 +78,6 @@ void quantize_q8_1_host(const float* x, int ncol, int k, int8_t* qs, Q8_1Ds* ds)
     const int nb = k / 32;
     for (int c = 0; c < ncol; ++c) {
         const float* xc = x + static_cast<size_t>(c) * k;
-        int8_t* qc = qs + static_cast<size_t>(c) * k;
-        Q8_1Ds* dc = ds + static_cast<size_t>(c) * nb;
         for (int b = 0; b < nb; ++b) {
             const float* xb = xc + static_cast<size_t>(b) * 32;
             float amax = 0.0f;
@@ -96,20 +94,26 @@ void quantize_q8_1_host(const float* x, int ncol, int k, int8_t* qs, Q8_1Ds* ds)
                 const float v = zero ? xb[l] : xb[l] / d32;
                 const float r = std::round(v);              // half away from zero
                 const int32_t q = zero ? 0 : static_cast<int32_t>(r);
-                qc[b * 32 + l] = static_cast<int8_t>(q);
+                qs[static_cast<size_t>(b) * ncol * 32 + static_cast<size_t>(c) * 32 + l] =
+                    static_cast<int8_t>(q);
                 sum += q;
             }
-            dc[b].sum_q = sum;
-            dc[b].d = f16_to_f32(f32_to_f16_rn(d32));
+            ds[static_cast<size_t>(b) * ncol + c].sum_q = sum;
+            ds[static_cast<size_t>(b) * ncol + c].d = f16_to_f32(f32_to_f16_rn(d32));
         }
     }
+}
+
+// Activation index for (32-value block `blk`, column `c`, lane `l`) under the
+// block-major [k/32][ncol][32] layout.
+static inline size_t q8_index(int blk, int c, int l, int ncol) {
+    return static_cast<size_t>(blk) * ncol * 32 + static_cast<size_t>(c) * 32 + l;
 }
 
 void matvec_q4_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
                            float* y, int in, int out, int ncol) {
     const int nb = in / QK_K;
     const size_t row_bytes = static_cast<size_t>(nb) * Q4K_BLOCK_BYTES;
-    const size_t blocks_per_col = static_cast<size_t>(nb) * 8;
     std::vector<float> sd(ncol), sm(ncol), acc(ncol);
     for (int r = 0; r < out; ++r) {
         const uint8_t* wr = w + static_cast<size_t>(r) * row_bytes;
@@ -126,17 +130,16 @@ void matvec_q4_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
                 const uint8_t* qsj = sb + 16 + (j >> 1) * 32;
                 const int shift = (j & 1) * 4;
                 for (int c = 0; c < ncol; ++c) {
-                    const int8_t* qc = qs + static_cast<size_t>(c) * in;
-                    const Q8_1Ds& rec = ds[static_cast<size_t>(c) * blocks_per_col + b * 8 + j];
-                    const int8_t* qb = qc + (b * 8 + j) * 32;
+                    const int32_t dot2 = ds[static_cast<size_t>(b * 8 + j) * ncol + c].sum_q;
                     int32_t dot1 = 0;
                     for (int l = 0; l < 32; ++l) {
                         const int nib = (qsj[l] >> shift) & 0xF;
-                        dot1 += nib * static_cast<int32_t>(qb[l]);
+                        dot1 += nib * static_cast<int32_t>(
+                            qs[q8_index(b * 8 + j, c, l, ncol)]);
                     }
-                    const int32_t dot2 = rec.sum_q;
-                    sd[c] += rec.d * static_cast<float>(dot1 * static_cast<int32_t>(sc));
-                    sm[c] += rec.d * static_cast<float>(dot2 * static_cast<int32_t>(m));
+                    const float d8 = ds[static_cast<size_t>(b * 8 + j) * ncol + c].d;
+                    sd[c] += d8 * static_cast<float>(dot1 * static_cast<int32_t>(sc));
+                    sm[c] += d8 * static_cast<float>(dot2 * static_cast<int32_t>(m));
                 }
             }
             for (int c = 0; c < ncol; ++c) {
@@ -151,7 +154,6 @@ void matvec_q6_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
                            float* y, int in, int out, int ncol) {
     const int nb = in / QK_K;
     const size_t row_bytes = static_cast<size_t>(nb) * Q6K_BLOCK_BYTES;
-    const size_t blocks_per_col = static_cast<size_t>(nb) * 8;
     std::vector<float> sd(ncol), acc(ncol);
     for (int r = 0; r < out; ++r) {
         const uint8_t* wr = w + static_cast<size_t>(r) * row_bytes;
@@ -167,20 +169,20 @@ void matvec_q6_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
                 for (int qq = 0; qq < 4; ++qq) {
                     const int g = nn * 4 + qq;
                     const int vshift = 2 * qq;
+                    const int8_t* qb = qs + q8_index(b * 8 + g, 0, 0, ncol);
                     for (int c = 0; c < ncol; ++c) {
-                        const int8_t* qc = qs + static_cast<size_t>(c) * in;
-                        const Q8_1Ds& rec = ds[static_cast<size_t>(c) * blocks_per_col + b * 8 + g];
-                        const int8_t* qb = qc + (b * 8 + g) * 32;
+                        const float d8 = ds[static_cast<size_t>(b * 8 + g) * ncol + c].d;
+                        const int8_t* qbc = qb + static_cast<size_t>(c) * 32;
                         for (int half = 0; half < 2; ++half) {
                             int32_t dot = 0;
                             for (int l = half * 16; l < half * 16 + 16; ++l) {
                                 const uint32_t b8 = (qq & 1) ? ql[l + 32] : ql[l];
                                 const int nib = (qq < 2) ? (b8 & 0xF) : (b8 >> 4);
                                 const int q6 = (nib | (((qh[l] >> vshift) & 3) << 4)) - 32;
-                                dot += q6 * static_cast<int32_t>(qb[l]);
+                                dot += q6 * static_cast<int32_t>(qbc[l]);
                             }
                             const int32_t scg = static_cast<int32_t>(sc[half + 2 * qq]);
-                            sd[c] += rec.d * static_cast<float>(dot * scg);
+                            sd[c] += d8 * static_cast<float>(dot * scg);
                         }
                     }
                 }

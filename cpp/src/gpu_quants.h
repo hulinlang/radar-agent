@@ -60,12 +60,24 @@ void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
                    cudaStream_t stream = nullptr);
 
 // y[c][out] = W[out][in] . dequant_int8(qs[c], ds[c]).
-// ncol must be <= 16; every column up to 16 must be quantized, because the
-// kernel is a fixed 2-rows x 16-columns warp tile (padding columns are computed
-// and ignored). Bit-exact with ri::matvec_q4_k_q8_1_host, which is bit-exact
-// with cpp/tests/ref_q4_int8.py.
+// ncol must be <= 16; the activation layout always carries 16 columns (the
+// prefill chunk width), and columns >= ncol are computed and dropped. The tile
+// shape does not change the arithmetic, so every variant is bit-exact with
+// ri::matvec_q4_k_q8_1_host, which is bit-exact with cpp/tests/ref_q4_int8.py.
+//
+// B11 prefill tile (rows x columns per warp). Chosen by an end-to-end paired
+// A/B in the engine, NOT by cpp/tests/gemv_bench.cpp (whose 200 back-to-back
+// calls on one 7 MB matrix run L2-resident and prefer a different tile).
+// RADAR_B11_TILE=<rw>x<nc> overrides it for that measurement.
+inline constexpr int B11_TILE_RW = 2;
+inline constexpr int B11_TILE_NC = 16;
+
 void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                    int in, int out, int ncol, cudaStream_t stream = nullptr);
+// Explicit tile, for the sweep and for regression-testing a specific shape.
+void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                        int in, int out, int ncol, int rw, int nc,
+                        cudaStream_t stream = nullptr);
 
 }  // namespace gpuq
 }  // namespace ri

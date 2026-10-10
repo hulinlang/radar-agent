@@ -710,6 +710,15 @@ struct GpuModel::Impl {
     float *d_xm = nullptr, *d_hm = nullptr, *d_qm = nullptr, *d_km = nullptr,
           *d_vm = nullptr, *d_attm = nullptr, *d_gatem = nullptr, *d_upm = nullptr,
           *d_ffnm = nullptr;
+    // ---- B11: int8 activations (prefill only, quantized weights only) ----
+    // RADAR_Q4_FP32_ACT=1 forces the pre-B11 fp32-activation route, which is
+    // what makes D3/D4 paired same-session measurements possible (docs/34 §3.5).
+    bool int8_act = true;
+    int8_t* d_q8s = nullptr;        // [MAX_MC][q8_k] int8 activation quants
+    Q8_1Ds* d_q8ds = nullptr;       // [MAX_MC][q8_k/32] scales + exact sums
+    int q8_k = 0;                   // allocated k (max of the gemv input dims)
+    int tile_rw = gpuq::B11_TILE_RW;   // RADAR_B11_TILE=RxC, measurement knob only
+    int tile_nc = gpuq::B11_TILE_NC;
     int* d_tokens = nullptr;
     // B8b slot pool + batch decode state
     int max_batch = 1;
@@ -768,6 +777,7 @@ struct GpuModel::Impl {
         free_if(d_xm); free_if(d_hm); free_if(d_qm); free_if(d_km); free_if(d_vm);
         free_if(d_attm); free_if(d_gatem); free_if(d_upm); free_if(d_ffnm);
         free_if(d_tokens);
+        free_if(d_q8s); free_if(d_q8ds);
         free_if(d_btok); free_if(d_bpos); free_if(d_bslot); free_if(d_next);
         free_if(d_logitsm);
         if (graph_exec_b) cudaGraphExecDestroy(graph_exec_b);
@@ -803,6 +813,20 @@ struct GpuModel::Impl {
             gpuq::gemv_q4k_mc(static_cast<const uint8_t*>(w.p), x, y, in, out, ncol, stream);
         } else {
             gpuq::gemv_q6k_mc(static_cast<const uint8_t*>(w.p), x, y, in, out, ncol, stream);
+        }
+    }
+
+    // B11: prefill-chunk dispatch. int8 activations are used only here (the
+    // batch-decode path above keeps calling gemv_mc) and only for quantized
+    // weights -- F16 and Q6_K stay on the fp32 route for now, so the F16 440/440
+    // record and the whole decode record are untouched (docs/34 §3.1, §6).
+    void gemv_prefill(const DevWeight& w, const float* x, float* y, int in, int out, int ncol) {
+        if (int8_act && w.type == 12 && in <= q8_k) {
+            gpuq::quantize_q8_1(x, d_q8s, d_q8ds, in, MAX_MC, stream);
+            gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
+                                     out, ncol, tile_rw, tile_nc, stream);
+        } else {
+            gemv_mc(w, x, y, in, out, ncol);
         }
     }
 
@@ -975,9 +999,9 @@ struct GpuModel::Impl {
             const size_t lv = lk + layer_v_stride;
 
             rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, w.attn_norm, d_hm, H, cfg.rms_eps);
-            prof_begin(PH_GEMV); gemv_mc(w.wq, d_hm, d_qm, H, Q, nr); prof_end(PH_GEMV);
-            prof_begin(PH_GEMV); gemv_mc(w.wk, d_hm, d_km, H, KV, nr); prof_end(PH_GEMV);
-            prof_begin(PH_GEMV); gemv_mc(w.wv, d_hm, d_vm, H, KV, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wq, d_hm, d_qm, H, Q, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wk, d_hm, d_km, H, KV, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wv, d_hm, d_vm, H, KV, nr); prof_end(PH_GEMV);
             rmsnorm_heads_many<<<nr * cfg.n_head, 128, 0, stream>>>(d_qm, w.q_norm, cfg.head_dim,
                                                                     cfg.rms_eps, cfg.n_head);
             rmsnorm_heads_many<<<nr * cfg.n_kv_head, 128, 0, stream>>>(d_km, w.k_norm, cfg.head_dim,
@@ -993,15 +1017,15 @@ struct GpuModel::Impl {
                 d_qm, d_kv, d_attm, lk, lv, block_stride, head_stride, cfg.n_head, cfg.n_kv_head,
                 cfg.head_dim, bt, pos_base, scale);
             prof_end(PH_ATTN);
-            prof_begin(PH_GEMV); gemv_mc(w.wo, d_attm, d_ffnm, Q, H, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wo, d_attm, d_ffnm, Q, H, nr); prof_end(PH_GEMV);
             add_many<<<(int)((static_cast<int64_t>(nr) * H + 255) / 256), 256, 0, stream>>>(
                 d_xm, d_ffnm, static_cast<int64_t>(nr) * H);
             rmsnorm_many<<<nr, 256, 0, stream>>>(d_xm, w.ffn_norm, d_hm, H, cfg.rms_eps);
-            prof_begin(PH_GEMV); gemv_mc(w.wg, d_hm, d_gatem, H, cfg.ffn, nr); prof_end(PH_GEMV);
-            prof_begin(PH_GEMV); gemv_mc(w.wu, d_hm, d_upm, H, cfg.ffn, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wg, d_hm, d_gatem, H, cfg.ffn, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wu, d_hm, d_upm, H, cfg.ffn, nr); prof_end(PH_GEMV);
             silu_up_many<<<(int)((static_cast<int64_t>(nr) * cfg.ffn + 255) / 256), 256, 0, stream>>>(
                 d_gatem, d_upm, static_cast<int64_t>(nr) * cfg.ffn);
-            prof_begin(PH_GEMV); gemv_mc(w.wd, d_gatem, d_ffnm, cfg.ffn, H, nr); prof_end(PH_GEMV);
+            prof_begin(PH_GEMV); gemv_prefill(w.wd, d_gatem, d_ffnm, cfg.ffn, H, nr); prof_end(PH_GEMV);
             add_many<<<(int)((static_cast<int64_t>(nr) * H + 255) / 256), 256, 0, stream>>>(
                 d_xm, d_ffnm, static_cast<int64_t>(nr) * H);
         }
@@ -1320,6 +1344,28 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     CU_CHECK(cudaMalloc(&m->d_upm, static_cast<size_t>(MC) * FF * 4));
     CU_CHECK(cudaMalloc(&m->d_ffnm, static_cast<size_t>(MC) * H * 4));
     CU_CHECK(cudaMalloc(&m->d_tokens, MC * sizeof(int)));
+    // B11 int8 activation scratch, sized to the largest gemv input dimension.
+    // RADAR_Q4_FP32_ACT=1 restores the pre-B11 fp32-activation route for the
+    // quantized weights (same-session A/B, docs/34 §3.5).
+    m->int8_act = std::getenv("RADAR_Q4_FP32_ACT") == nullptr;
+    m->q8_k = std::max(std::max(H, Q), std::max(KV, FF));
+    CU_CHECK(cudaMalloc(&m->d_q8s, static_cast<size_t>(MC) * m->q8_k));
+    CU_CHECK(cudaMalloc(&m->d_q8ds,
+                        static_cast<size_t>(MC) * (m->q8_k / 32) * sizeof(Q8_1Ds)));
+    // RADAR_B11_TILE=RxC: same-session A/B of the int8 prefill tile. The tile is
+    // a pure memory-shape knob (it never changes the accumulation order), so this
+    // is how the default was chosen -- see docs/34 §7.
+    if (const char* tile = std::getenv("RADAR_B11_TILE")) {
+        int rw = 0, nc = 0;
+        if (std::sscanf(tile, "%dx%d", &rw, &nc) == 2 && rw * nc == 32 && rw > 0 && nc > 0) {
+            m->tile_rw = rw;
+            m->tile_nc = nc;
+        } else {
+            std::fprintf(stderr, "[b11] ignoring malformed RADAR_B11_TILE=%s\n", tile);
+        }
+    }
+    std::fprintf(stderr, "[b11] int8 activations %s (prefill, quantized weights only; tile %dx%d)\n",
+                 m->int8_act ? "ON" : "OFF (RADAR_Q4_FP32_ACT)", m->tile_rw, m->tile_nc);
     CU_CHECK(cudaDeviceSynchronize());
     m->prof_init();
     // CUDA graph replay per decode token (RADAR_NO_CUDA_GRAPH=1 to force eager;

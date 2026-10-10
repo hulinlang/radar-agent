@@ -1,0 +1,14 @@
+tensor blk.0.attn_output.weight
+ggml_type 12
+in 2048
+out 2048
+nb 8
+ncol 16
+nrow 2048
+seed 24301
+x_fnv ebca5bdcf47759bd
+q8_fnv 2ac2028643c286f6
+y_fnv 9debf8b609d1ee80
+int8_vs_fp32act_max_rel 3.815554e-03
+int8_vs_dequantact_max_rel 1.058611e-06
+y_scale 2.017957e+02

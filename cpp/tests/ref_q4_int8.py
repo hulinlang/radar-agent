@@ -147,13 +147,14 @@ def quantize_q8_1(x):
 
 
 def q8_pack(d, sum_q, qs):
-    """Pack into the split layout the C++/CUDA side reads:
-    int8 qs[ncol][k] (block-major) followed by Q8_1Ds ds[ncol][k/32]."""
+    """Pack into the block-major layout the C++/CUDA side reads:
+    int8 qs[k/32][ncol][32] (a block's columns contiguous) followed by
+    Q8_1Ds ds[k/32][ncol]."""
     ncol, nb = d.shape
-    qflat = np.ascontiguousarray(qs.reshape(ncol, nb * 32)).view(np.uint8).reshape(-1)
-    ds = np.zeros((ncol, nb, 8), dtype=np.uint8)
-    ds[:, :, 0:4] = np.ascontiguousarray(d.astype(np.float32)).view(np.uint8).reshape(ncol, nb, 4)
-    ds[:, :, 4:8] = np.ascontiguousarray(sum_q.astype(np.int32)).view(np.uint8).reshape(ncol, nb, 4)
+    qflat = np.ascontiguousarray(qs.transpose(1, 0, 2)).reshape(-1).view(np.uint8)
+    ds = np.zeros((nb, ncol, 8), dtype=np.uint8)
+    ds[:, :, 0:4] = np.ascontiguousarray(d.astype(np.float32).T).view(np.uint8).reshape(nb, ncol, 4)
+    ds[:, :, 4:8] = np.ascontiguousarray(sum_q.astype(np.int32).T).view(np.uint8).reshape(nb, ncol, 4)
     return np.concatenate([qflat, ds.reshape(-1)])
 
 

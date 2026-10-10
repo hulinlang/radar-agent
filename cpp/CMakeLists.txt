@@ -86,6 +86,11 @@ if(CMAKE_CUDA_COMPILER)
   add_executable(gemv-bench src/gguf.cpp tests/gemv_bench.cpp)
   target_include_directories(gemv-bench PRIVATE src)
   target_link_libraries(gemv-bench PRIVATE radar_gpu CUDA::cudart)
+# B11：纯读带宽探针（同一份权重、三种访存形态），用来判断 gemv 的天花板在哪
+  add_executable(b11-roof src/gguf.cpp tests/b11_roof.cu)
+  target_include_directories(b11-roof PRIVATE src)
+  target_link_libraries(b11-roof PRIVATE CUDA::cudart)
+  set_target_properties(b11-roof PROPERTIES CUDA_ARCHITECTURES "89")
 # B11：层①对拍的 CUDA 半边（同一份参考文件，逐元素 bit-exact）
   add_executable(int8-ref-test-cuda src/gguf.cpp src/int8_act.cpp tests/int8_ref_test.cpp)
   target_include_directories(int8-ref-test-cuda PRIVATE src)

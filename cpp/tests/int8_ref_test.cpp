@@ -228,9 +228,50 @@ int main(int argc, char** argv) {
                     m.rel_act, m.rel_ord);
 
 #if defined(USE_CUDA)
-        // ---- 3. CUDA int8 gemv, bit-exact vs the same reference ----
-        // Only Q4_K has a CUDA int8 kernel: docs/34 section 6 keeps Q6_K on the
-        // fp32 route until D3 says whether it is needed to reach 1000 tok/s.
+        // ---- 3. CUDA int8 path, bit-exact vs the same reference ----
+        // 3a. the CUDA *quantizer* too: the engine uses this one, not the host
+        //     one, and the first B11 attempt shipped a broken __reduce_add_sync
+        //     that this check now catches (it produced garbage sum_q -> garbage
+        //     Q4_K offset term -> teacher-agreement 0/50).
+        {
+            float* dx = nullptr;
+            int8_t* dqs = nullptr;
+            ri::Q8_1Ds* dds = nullptr;
+            auto ck = [](cudaError_t e, const char* what) {
+                if (e != cudaSuccess) {
+                    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+                }
+            };
+            ck(cudaMalloc(&dx, xb.size()), "cudaMalloc x");
+            ck(cudaMalloc(&dqs, qs_bytes), "cudaMalloc qs");
+            ck(cudaMalloc(&dds, ds_bytes), "cudaMalloc ds");
+            ck(cudaMemcpy(dx, xb.data(), xb.size(), cudaMemcpyHostToDevice), "memcpy x");
+            ri::gpuq::quantize_q8_1(dx, dqs, dds, static_cast<int>(m.in),
+                                    static_cast<int>(m.ncol));
+            std::vector<int8_t> cqs(qs_bytes);
+            std::vector<ri::Q8_1Ds> cds(nq);
+            ck(cudaMemcpy(cqs.data(), dqs, qs_bytes, cudaMemcpyDeviceToHost), "memcpy qs back");
+            ck(cudaMemcpy(cds.data(), dds, ds_bytes, cudaMemcpyDeviceToHost), "memcpy ds back");
+            cudaFree(dx);
+            cudaFree(dqs);
+            cudaFree(dds);
+            size_t bad_qs = 0, bad_ds = 0, first = 0;
+            for (size_t i = 0; i < qs_bytes; ++i)
+                if (cqs[i] != qsv[i]) { if (!bad_qs) first = i; ++bad_qs; }
+            const uint8_t* cdsb = reinterpret_cast<const uint8_t*>(cds.data());
+            const uint8_t* rdsb = reinterpret_cast<const uint8_t*>(dsv.data());
+            for (size_t i = 0; i < ds_bytes; ++i)
+                if (cdsb[i] != rdsb[i]) { if (!bad_ds) first = qs_bytes + i; ++bad_ds; }
+            if (bad_qs == 0 && bad_ds == 0) {
+                std::printf("cuda quantize_q8_1   %zu blocks  EXACT (qs+ds)\n", nq);
+            } else {
+                std::printf("cuda quantize_q8_1   MISMATCH qs=%zu ds=%zu bytes, first %zu\n",
+                            bad_qs, bad_ds, first);
+                ++fails;
+            }
+        }
+        // 3b. the gemv. Only Q4_K has a CUDA int8 kernel: docs/34 section 6 keeps
+        //     Q6_K on the fp32 route until D3 says whether it is needed.
         if (m.type != 12) {
             std::printf("cuda Q6_K int8 gemv  SKIPPED (still on the fp32 route)\n");
         } else {

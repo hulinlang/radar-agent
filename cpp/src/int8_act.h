@@ -30,10 +30,18 @@ struct Q8_1Ds {
 };
 static_assert(sizeof(Q8_1Ds) == 8, "Q8_1Ds must be 8 bytes");
 
-// Activation layout ("split", the same shape llama.cpp's MMQ uses: contiguous
-// quants plus a separate scale array). Both halves stay 16-byte alignable:
-//   qs: [ncol][k]     int8, qs[c*k + (block*32 + lane)]
-//   ds: [ncol][k/32]
+// Activation layout, block-major: [k/32][ncol][32] quants plus a separate
+// [k/32][ncol] scale array.
+//
+//   qs[block*ncol*32 + c*32 + lane]
+//   ds[block*ncol + c]
+//
+// The *column-minor* order inside a block is what makes the CUDA gemv viable:
+// with a column-major [ncol][k] layout one warp load touches one 128-byte line
+// per column (16 lines), and B11 measured that as a 2.4x net SLOWDOWN versus the
+// fp32 route despite ~2x fewer instructions. Packing a block's columns together
+// turns the same load into 4 lines. `ncol` here is the allocated column count
+// (16 = the prefill chunk width), which is what the kernel's tile assumes.
 // k must be a multiple of 32.
 void quantize_q8_1_host(const float* x, int ncol, int k, int8_t* qs, Q8_1Ds* ds);
 
