@@ -5,10 +5,14 @@
 
 #include "gpu_model.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_fp16.h>
@@ -721,6 +725,20 @@ struct GpuModel::Impl {
     std::vector<int> h_nblk;        // host mirror of d_nblk
     std::vector<int> free_blocks;   // free stack (pop from back)
     int used_blocks = 0;
+    // ---- B10b: cross-request prefix cache ----
+    bool prefix_cache = true;                       // RADAR_NO_PREFIX_CACHE=1 disables
+    std::vector<std::vector<int32_t>> hist;         // per-slot token history
+    std::vector<char> hist_valid;                   // history seen from position 0?
+    std::vector<char> seq_active;                   // slot holds a live sequence?
+    std::vector<int> blk_refcount;                  // per-block reference count
+    std::vector<char> blk_cached;                   // block registered in prefix_index?
+    std::vector<char> blk_free;                     // block currently on the free stack?
+    std::vector<uint64_t> blk_hash;                 // cached content hash
+    std::vector<std::array<int32_t, BLOCK>> blk_toks;  // cached tokens (collision check)
+    std::vector<std::vector<uint64_t>> seq_blk_hash;   // [slot][b] chain hash
+    std::unordered_map<uint64_t, int> prefix_index;    // chain hash -> block id
+    int prefix_hits = 0, prefix_misses = 0;
+    int last_reused = 0;
     int *d_btok = nullptr, *d_bpos = nullptr, *d_bslot = nullptr;
     int32_t* d_next = nullptr;
     float* d_logitsm = nullptr;     // [max_batch][vocab]
@@ -789,20 +807,107 @@ struct GpuModel::Impl {
     }
 
     // ---- B10: block pool bookkeeping (host side) ----
+    // FNV-1a over the raw bytes of `n` int32 (stable across machines).
+    static uint64_t hash_mix(uint64_t h, const int32_t* p, int n) {
+        for (int i = 0; i < n; ++i) {
+            const uint32_t v = static_cast<uint32_t>(p[i]);
+            for (int k = 0; k < 4; ++k) {
+                h ^= static_cast<uint64_t>((v >> (8 * k)) & 0xffu);
+                h *= 1099511628211ULL;
+            }
+        }
+        return h;
+    }
+
+    bool block_matches(int blk, const int32_t* toks) const {
+        for (int j = 0; j < BLOCK; ++j)
+            if (blk_toks[blk][j] != toks[j]) return false;
+        return true;
+    }
+
+    // Takes a block off the free stack. A block that was released still sits in
+    // the prefix index (that is the cache); reusing it for *different* content
+    // must therefore drop its stale entry first.
+    int alloc_block() {
+        while (!free_blocks.empty()) {
+            const int bid = free_blocks.back();
+            free_blocks.pop_back();
+            blk_free[bid] = 0;
+            if (blk_cached[bid]) {
+                prefix_index.erase(blk_hash[bid]);
+                blk_cached[bid] = 0;
+            }
+            blk_refcount[bid] = 1;
+            return bid;
+        }
+        return -1;
+    }
+
+    // A cache hit on a block whose refcount was 0 must take it OFF the free
+    // stack, or a later alloc could hand out the same physical block twice.
+    void claim_free_block(int bid) {
+        if (!blk_free[bid]) return;
+        for (size_t i = 0; i < free_blocks.size(); ++i) {
+            if (free_blocks[i] == bid) {
+                free_blocks[i] = free_blocks.back();
+                free_blocks.pop_back();
+                break;
+            }
+        }
+        blk_free[bid] = 0;
+    }
+
     // Ensures sequence `seq` owns blocks covering positions [0, upto).
-    // Blocks are handed out lazily as the sequence grows — that is the whole
-    // point of paging: a 100-token sequence no longer reserves kv_cap of KV.
-    // Returns false when the pool is exhausted.
-    bool ensure_blocks(int seq, int upto) {
-        if (upto <= 0) return true;
+    // Returns the number of LEADING blocks that came from the cross-request
+    // prefix cache — i.e. exactly the tokens a caller may skip computing.
+    int ensure_blocks(int seq, int upto) {
+        if (upto <= 0) return 0;
         const int need = (upto + BLOCK - 1) / BLOCK;
         if (need > max_blocks) fail("sequence exceeds kv_cap");
         int& have = h_nblk[seq];
-        if (need <= have) return true;
+        if (need <= have) return 0;
+        const std::vector<int32_t>& h = hist[seq];
+        const bool can_hash = prefix_cache && hist_valid[seq] != 0;
+        int leading = 0;
+        uint64_t prev = (have > 0) ? seq_blk_hash[seq][have - 1] : 0;
+        int* row = &h_block_table[static_cast<size_t>(seq) * max_blocks];
         while (have < need) {
-            if (free_blocks.empty()) return false;
-            h_block_table[static_cast<size_t>(seq) * max_blocks + have] = free_blocks.back();
-            free_blocks.pop_back();
+            const int b = have;
+            const int32_t* toks =
+                (h.size() >= static_cast<size_t>((b + 1) * BLOCK))
+                    ? h.data() + static_cast<size_t>(b) * BLOCK
+                    : nullptr;
+            int bid = -1;
+            if (can_hash && toks) {
+                const uint64_t hsh = hash_mix(prev, toks, BLOCK);
+                const auto it = prefix_index.find(hsh);
+                if (it != prefix_index.end() && block_matches(it->second, toks)) {
+                    bid = it->second;          // shared: same tokens, same positions
+                    claim_free_block(bid);
+                    ++blk_refcount[bid];
+                    ++prefix_hits;
+                    if (b == leading) ++leading;
+                } else {
+                    ++prefix_misses;
+                }
+                if (bid < 0) {
+                    bid = alloc_block();
+                    if (bid < 0) fail("KV block pool exhausted (raise num_blocks)");
+                    std::memcpy(blk_toks[bid].data(), toks, BLOCK * sizeof(int32_t));
+                    blk_hash[bid] = hsh;
+                    blk_cached[bid] = 1;
+                    prefix_index[hsh] = bid;
+                }
+                seq_blk_hash[seq][b] = hsh;
+                prev = hsh;
+            } else {
+                // Partial tail block (or caching off): never shared, never indexed.
+                bid = alloc_block();
+                if (bid < 0) fail("KV block pool exhausted (raise num_blocks)");
+                seq_blk_hash[seq][b] = 0;
+                prev = 0;
+            }
+            row[b] = bid;
             ++have;
             ++used_blocks;
         }
@@ -811,23 +916,38 @@ struct GpuModel::Impl {
         CU_CHECK(cudaMemcpyAsync(d_nblk + seq, &h_nblk[seq], sizeof(int),
                                  cudaMemcpyHostToDevice, stream));
         CU_CHECK(cudaMemcpyAsync(d_block_table + static_cast<size_t>(seq) * max_blocks,
-                                 &h_block_table[static_cast<size_t>(seq) * max_blocks],
-                                 static_cast<size_t>(have) * sizeof(int),
+                                 row, static_cast<size_t>(have) * sizeof(int),
                                  cudaMemcpyHostToDevice, stream));
-        return true;
+        return leading;
     }
 
-    // Returns a slot's blocks to the pool. Called when a new sequence starts in
-    // that slot (prefill_batch with pos0 == 0); without it, a slot reused across
-    // requests would only ever grow its block count.
+    // Returns a slot's blocks to the pool. A block whose refcount reaches 0 goes
+    // back on the free stack but **stays in the prefix index** — that is exactly
+    // what lets a later request with the same prefix hit the cache.
     void release_slot_blocks(int seq) {
         const int have = h_nblk[seq];
-        for (int b = 0; b < have; ++b)
-            free_blocks.push_back(h_block_table[static_cast<size_t>(seq) * max_blocks + b]);
+        int* row = &h_block_table[static_cast<size_t>(seq) * max_blocks];
+        for (int b = 0; b < have; ++b) {
+            const int bid = row[b];
+            if (bid >= 0 && --blk_refcount[bid] == 0) {
+                free_blocks.push_back(bid);
+                blk_free[bid] = 1;
+            }
+        }
         used_blocks -= have;
         h_nblk[seq] = 0;
         CU_CHECK(cudaMemcpyAsync(d_nblk + seq, &h_nblk[seq], sizeof(int),
                                  cudaMemcpyHostToDevice, stream));
+    }
+
+    // B10b: start a new sequence in `slot`.
+    void begin_sequence(int slot) {
+        release_slot_blocks(slot);
+        hist[slot].clear();
+        hist_valid[slot] = 1;
+        seq_active[slot] = 1;
+        if (!seq_blk_hash[slot].empty())
+            std::fill(seq_blk_hash[slot].begin(), seq_blk_hash[slot].end(), 0);
     }
 
     // One prefill chunk: rows 0..nr-1 of the multi-column buffers are sequence
@@ -1167,6 +1287,17 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     CU_CHECK(cudaStreamCreate(&m->stream));
     m->free_blocks.resize(m->num_blocks);
     for (int i = 0; i < m->num_blocks; ++i) m->free_blocks[i] = m->num_blocks - 1 - i;
+    // B10b prefix-cache state
+    m->prefix_cache = std::getenv("RADAR_NO_PREFIX_CACHE") == nullptr;
+    m->hist.resize(m->n_slots);
+    m->hist_valid.assign(m->n_slots, 0);
+    m->seq_active.assign(m->n_slots, 0);
+    m->blk_refcount.assign(m->num_blocks, 0);
+    m->blk_cached.assign(m->num_blocks, 0);
+    m->blk_free.assign(m->num_blocks, 1);   // all start on the free stack
+    m->blk_hash.assign(m->num_blocks, 0);
+    m->blk_toks.resize(m->num_blocks);
+    m->seq_blk_hash.assign(m->n_slots, std::vector<uint64_t>(m->max_blocks, 0));
     if (max_batch > 1) {
         // B8b batch-decode state
         CU_CHECK(cudaMalloc(&m->d_btok, max_batch * sizeof(int)));
@@ -1202,8 +1333,17 @@ void GpuModel::forward_logits(int32_t token, int pos, float* logits_out) {
     const ModelConfig& c = m->cfg;
     if (token < 0 || token >= c.vocab) fail("token out of range");
     if (pos < 0 || pos >= m->kv_cap) fail("position exceeds kv_cap");
+    // B10b: keep the token history in sync so a later prefill can hash prefixes.
+    if (pos == 0 && !m->seq_active[0]) m->begin_sequence(0);
+    if (static_cast<size_t>(pos) < m->hist[0].size()) {
+        m->hist[0].resize(static_cast<size_t>(pos));
+    } else if (static_cast<size_t>(pos) > m->hist[0].size()) {
+        m->hist[0].clear();
+        m->hist_valid[0] = 0;
+    }
+    m->hist[0].push_back(token);
     // B10: make sure slot 0 owns a block covering `pos` (lazy growth).
-    if (!m->ensure_blocks(0, pos + 1)) fail("KV block pool exhausted (raise num_blocks)");
+    m->ensure_blocks(0, pos + 1);
 
     m->h_step[0] = token;
     m->h_step[1] = pos;
@@ -1252,12 +1392,31 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
     const ModelConfig& c = m->cfg;
     if (n <= 0 || pos0 < 0 || pos0 + n > m->kv_cap) fail("prefill range out of kv_cap");
     if (slot < 0 || slot >= m->n_slots) fail("prefill slot out of range");
-    // B10: pos0 == 0 means "a new sequence starts in this slot" → return the
-    // previous sequence's blocks first, otherwise a slot reused across requests
-    // would only ever grow its block count.
-    if (pos0 == 0) m->release_slot_blocks(slot);
-    if (!m->ensure_blocks(slot, pos0 + n)) fail("KV block pool exhausted (raise num_blocks)");
-    for (int base = 0; base < n; base += Impl::MAX_MC) {
+    // B10/B10b: pos0 == 0 with no live sequence means "a new sequence starts in
+    // this slot" → release the previous one's blocks and reset its token history.
+    if (pos0 == 0 && !m->seq_active[slot]) m->begin_sequence(slot);
+    // The token history is what the prefix cache hashes. It must mirror what is
+    // actually in the slot's KV: truncate to pos0 (the caller is overwriting
+    // everything after it), or give up on hashing if we never saw position 0.
+    if (static_cast<size_t>(pos0) < m->hist[slot].size()) {
+        m->hist[slot].resize(static_cast<size_t>(pos0));
+    } else if (static_cast<size_t>(pos0) > m->hist[slot].size()) {
+        m->hist[slot].clear();
+        m->hist_valid[slot] = 0;
+    }
+    m->hist[slot].insert(m->hist[slot].end(), tokens, tokens + n);
+    // ⭐ B10b: leading blocks may come from the cross-request prefix cache, whose
+    // KV is already correct AND identical — so skip computing them. Same argument
+    // as B9's session LCP: identical tokens at identical positions produce
+    // identical KV, bit for bit.
+    const int leading = m->ensure_blocks(slot, pos0 + n);
+    int skip = leading * BLOCK;
+    if (skip >= n) skip = n - 1;   // always compute one position to get logits
+    m->last_reused = skip;
+    if (skip > 0)
+        std::fprintf(stderr, "[b10] prefix reuse: slot=%d prompt=%d reused=%d computed=%d\n",
+                     slot, n, skip, n - skip);
+    for (int base = skip; base < n; base += Impl::MAX_MC) {
         const int nr = std::min(static_cast<int>(Impl::MAX_MC), n - base);
         CU_CHECK(cudaMemcpyAsync(m->d_tokens, tokens + base, nr * sizeof(int),
                                  cudaMemcpyHostToDevice, m->stream));
@@ -1266,7 +1425,7 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
         m->prof_end(Impl::PH_TOTAL);
         m->prof_collect();
     }
-    const int last = (n - 1) % Impl::MAX_MC;  // row of the last position
+    const int last = (n - 1 - skip) % Impl::MAX_MC;  // row of the last position
     m->prof_begin(Impl::PH_LOGITS);
     m->gemv(m->d_embd, m->d_hm + static_cast<size_t>(last) * c.hidden,
             m->d_logits, c.hidden, c.vocab);
@@ -1295,6 +1454,14 @@ size_t GpuModel::kv_worst_case_bytes() const {
            impl_->block_stride * 2 * impl_->cfg.n_layer * sizeof(float);
 }
 
+void GpuModel::begin_sequence(int slot) {
+    if (slot < 0 || slot >= impl_->n_slots) fail("begin_sequence: slot out of range");
+    impl_->begin_sequence(slot);
+}
+int GpuModel::last_reused_tokens() const { return impl_->last_reused; }
+int GpuModel::prefix_hits() const { return impl_->prefix_hits; }
+int GpuModel::prefix_misses() const { return impl_->prefix_misses; }
+
 // B8b: one decode step for the padded batch. tokens/positions/slots are
 // max_batch-element host arrays; padding rows must use slot == max_batch
 // (scratch). Graph-captured at the first call, replayed afterwards.
@@ -1303,11 +1470,20 @@ void GpuModel::decode_batch(const int32_t* tokens, const int* positions, const i
     Impl* m = impl_;
     const int B = m->max_batch;
     if (B <= 1) fail("decode_batch requires max_batch > 1");
-    // B10: cover every row — including the padding/scratch slot, whose KV store
-    // is real even though its attention output is discarded.
-    for (int i = 0; i < B; ++i)
-        if (!m->ensure_blocks(slots[i], positions[i] + 1))
-            fail("KV block pool exhausted (raise num_blocks)");
+    // B10/B10b: keep each row's token history in sync, then cover every row —
+    // including the padding/scratch slot, whose KV store is real even though its
+    // attention output is discarded.
+    for (int i = 0; i < B; ++i) {
+        const int s = slots[i];
+        if (static_cast<size_t>(positions[i]) < m->hist[s].size()) {
+            m->hist[s].resize(static_cast<size_t>(positions[i]));
+        } else if (static_cast<size_t>(positions[i]) > m->hist[s].size()) {
+            m->hist[s].clear();
+            m->hist_valid[s] = 0;
+        }
+        m->hist[s].push_back(tokens[i]);
+        m->ensure_blocks(s, positions[i] + 1);
+    }
     for (int i = 0; i < B; ++i) {
         m->h_bstage[i] = tokens[i];
         m->h_bstage[B + i] = positions[i];

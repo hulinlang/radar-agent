@@ -192,13 +192,18 @@ int main(int argc, char** argv) {
             size_t next_req = 0;
             std::vector<float> logits(gpu.config().vocab);
             double prefill_s = 0.0;
+            int reused_total = 0;   // B10b: tokens served from the prefix cache
             auto assign = [&](int s) {
                 if (next_req >= reqs.size()) return;
                 Req& r = reqs[next_req];
+                // B10b: the slot is being handed to a new request, so release the
+                // previous one's blocks and forget its token history.
+                gpu.begin_sequence(s);
                 const auto a = Clock::now();
                 gpu.prefill_batch(r.prompt.data(), static_cast<int>(r.prompt.size()),
                                   logits.data(), s);
                 prefill_s += secs(a, Clock::now());
+                reused_total += gpu.last_reused_tokens();
                 r.next = argmax(logits);
                 r.pos = static_cast<int>(r.prompt.size());
                 slot_req[s] = static_cast<int>(next_req);
@@ -277,9 +282,11 @@ int main(int argc, char** argv) {
             }();
             std::fprintf(stderr,
                          "batch decode: %zu tokens in %.2fs -> %.1f tok/s aggregate\n"
-                         "  (decode steps wall %.2fs; interleaved prefill %.2fs; initial prefill %.2fs)\n",
+                         "  (decode steps wall %.2fs; interleaved prefill %.2fs; initial prefill %.2fs)\n"
+                         "  [b10] prefix cache: reused_prompt_tokens=%d hits=%d misses=%d\n",
                          total_gen, wall, total_gen / wall,
-                         wall - decode_prefill_s, decode_prefill_s, prefill_s - decode_prefill_s);
+                         wall - decode_prefill_s, decode_prefill_s, prefill_s - decode_prefill_s,
+                         reused_total, gpu.prefix_hits(), gpu.prefix_misses());
             for (size_t i = 0; i < reqs.size(); ++i)
                 std::printf("=== req %zu ===\n%s\n", i, tok.decode(reqs[i].gen).c_str());
             return 0;

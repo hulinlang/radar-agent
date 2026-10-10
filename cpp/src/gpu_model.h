@@ -37,6 +37,18 @@ public:
     size_t kv_bytes() const;
     size_t kv_worst_case_bytes() const;
 
+    // B10b: start a new sequence in `slot`. Releases the previous sequence's
+    // blocks (a block whose refcount drops to 0 returns to the free stack but
+    // STAYS in the prefix index — that is what makes the cache work across
+    // requests) and forgets its token history. Call it whenever a scheduler
+    // hands a reused slot to a new request.
+    void begin_sequence(int slot);
+    // B10b: tokens served from the cross-request prefix cache by the most
+    // recent prefill_batch call (0 when nothing matched).
+    int last_reused_tokens() const;
+    int prefix_hits() const;
+    int prefix_misses() const;
+
     // Runs one token at absolute position pos; writes the vocab logits to
     // logits_out (host buffer, vocab floats).
     void forward_logits(int32_t token, int pos, float* logits_out);
