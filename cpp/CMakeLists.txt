@@ -91,6 +91,12 @@ if(CMAKE_CUDA_COMPILER)
   target_include_directories(b11-roof PRIVATE src)
   target_link_libraries(b11-roof PRIVATE CUDA::cudart)
   set_target_properties(b11-roof PROPERTIES CUDA_ARCHITECTURES "89")
+# B12：int8 MMA 探针 —— 先量再写 kernel（docs/36 §4 step 1）。
+#   回答的不是"MMA 多快"（已知 1023.8 MAC/SM/clk），而是"Q4_K 的 4bit->8bit
+#   现场解包要花多少"，因为 chunk 该多宽正比于该系数：开销 = 16c/T。
+  add_executable(b12-roof tests/b12_roof.cu)
+  target_link_libraries(b12-roof PRIVATE CUDA::cudart)
+  set_target_properties(b12-roof PROPERTIES CUDA_ARCHITECTURES "89")
 # B11：层①对拍的 CUDA 半边（同一份参考文件，逐元素 bit-exact）
   add_executable(int8-ref-test-cuda src/gguf.cpp src/int8_act.cpp tests/int8_ref_test.cpp)
   target_include_directories(int8-ref-test-cuda PRIVATE src)
