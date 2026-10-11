@@ -501,22 +501,26 @@ void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
 }
 
 void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
-                   int in, int out, int ncol, cudaStream_t stream) {
+                   int in, int out, int ncol, int lc, cudaStream_t stream) {
     // ⚠️ The tile is chosen from the END-TO-END paired measurement, not from the
     // isolated bench: gemv-bench calls the same 7 MB matrix 200 times in a row,
     // so it runs L2-resident, while the engine streams ~900 MB per chunk with no
     // reuse. The two disagree (bench prefers 4x8 for the wide shapes; the engine
     // measures 8x4 faster), and only the engine number is real.
-    gemv_q4k_q8_1_tile(w, qs, ds, y, in, out, ncol, B11_TILE_RW, B11_TILE_NC, stream);
+    gemv_q4k_q8_1_tile(w, qs, ds, y, in, out, ncol, B11_TILE_RW, B11_TILE_NC, lc, stream);
 }
 
-void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
-                        int in, int out, int ncol, int rw, int nc, cudaStream_t stream) {
-    // LC is the ALLOCATED activation stride, which is now the worst-case prefill
-    // width and no longer equals the chunk width. `ncol` (valid columns) is passed
-    // down so the kernel can skip the padding columns -- otherwise it would write
-    // y past the caller's buffer (a latent OOB while LC == 16 == the width).
-    constexpr int LC = B11_LC;
+namespace {
+
+// LC is the ALLOCATED activation stride. It MUST match the stride the qs/ds data
+// was built with: the engine allocates B11_LC columns, while int8-ref-test's
+// golden payloads use stride = ncol. Getting this wrong reads out of bounds --
+// which is exactly how the first version of the W widening failed layer 1 on CUDA
+// (it hard-coded LC = B11_LC while the test payload was 16 columns wide).
+// `ncol` (valid columns) is passed down so the kernel can skip padding columns.
+template <int LC>
+void gemv_q4k_q8_1_tile_lc(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                           int in, int out, int ncol, int rw, int nc, cudaStream_t stream) {
     constexpr int WPB = 4;   // warps per block
     // rows_per_block = RW * WPB, so the grid is ceil(out / (RW * 4)).
     switch (rw * 100 + nc) {
@@ -550,6 +554,18 @@ void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, fl
                 <<<(out + B11_TILE_RW * WPB - 1) / (B11_TILE_RW * WPB), 128, 0, stream>>>(
                     w, qs, ds, y, in, out, ncol);
             break;
+    }
+}
+
+}  // namespace
+
+void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                        int in, int out, int ncol, int rw, int nc, int lc,
+                        cudaStream_t stream) {
+    if (lc > 16) {
+        gemv_q4k_q8_1_tile_lc<B11_LC>(w, qs, ds, y, in, out, ncol, rw, nc, stream);
+    } else {
+        gemv_q4k_q8_1_tile_lc<16>(w, qs, ds, y, in, out, ncol, rw, nc, stream);
     }
 }
 

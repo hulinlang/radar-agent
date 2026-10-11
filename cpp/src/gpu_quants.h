@@ -60,9 +60,16 @@ void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
                    cudaStream_t stream = nullptr);
 
 // y[c][out] = W[out][in] . dequant_int8(qs[c], ds[c]).
-// ncol must be <= 16; the activation layout always carries 16 columns (the
-// prefill chunk width), and columns >= ncol are computed and dropped. The tile
-// shape does not change the arithmetic, so every variant is bit-exact with
+//
+// ⚠️ `lc` is the ALLOCATED column stride of the qs/ds layout, and it must match
+// what the data was actually built with -- it is NOT the same thing as `ncol`
+// (the number of valid columns). Two callers legitimately differ: the engine
+// allocates MAX_PREFILL (B11_LC) columns, while int8-ref-test's golden payloads
+// are built with stride = ncol. Passing the wrong one reads out of bounds.
+// `lc <= 16` selects the historical 16-column layout; anything larger selects
+// B11_LC. Columns >= ncol are skipped, so y only needs ncol columns.
+//
+// The tile shape does not change the arithmetic, so every variant is bit-exact with
 // ri::matvec_q4_k_q8_1_host, which is bit-exact with cpp/tests/ref_q4_int8.py.
 //
 // B11 prefill tile (rows x columns per warp). Chosen by an end-to-end paired
@@ -72,19 +79,18 @@ void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
 inline constexpr int B11_TILE_RW = 2;
 inline constexpr int B11_TILE_NC = 16;
 
-// B13 step 8: the ALLOCATED activation stride (column count) for the int8 route.
-// It used to be 16 = the chunk width, which conflated "how many columns exist" with
-// "how many are valid". Widening the prefill width (docs/37 §7.4: the Q6_K kernel
-// is latency-bound at W=16, so each weight load must feed more MMAs) requires them
-// to be separate: LC is the stride of the Q8_1 layout, while `ncol` is the number of
-// valid columns. Must match MAX_PREFILL in gpu_model.cu.
+// B13 step 8: the engine's ALLOCATED activation stride (column count) for the
+// int8 route. It used to be 16 = the chunk width, which conflated "how many
+// columns exist" with "how many are valid". Widening the prefill width (docs/37
+// §7.4: the kernels are latency-bound at W=16, so each weight load must feed more
+// MMAs) requires them to be separate. Must match MAX_PREFILL in gpu_model.cu.
 inline constexpr int B11_LC = 64;
 
 void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
-                   int in, int out, int ncol, cudaStream_t stream = nullptr);
+                   int in, int out, int ncol, int lc = 16, cudaStream_t stream = nullptr);
 // Explicit tile, for the sweep and for regression-testing a specific shape.
 void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
-                        int in, int out, int ncol, int rw, int nc,
+                        int in, int out, int ncol, int rw, int nc, int lc = 16,
                         cudaStream_t stream = nullptr);
 
 // ---------------- B12: int8 MMA (tensor core), prefill only ----------------

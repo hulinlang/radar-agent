@@ -870,7 +870,8 @@ struct GpuModel::Impl {
                                        out, ncol, MAX_PREFILL, stream);
                 } else {
                     gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y,
-                                             in, out, ncol, tile_rw, tile_nc, stream);
+                                             in, out, ncol, tile_rw, tile_nc, MAX_PREFILL,
+                                             stream);
                 }
             } else {
                 // B13: Q6_K has only the m16n8k16 variant -- K=16 is exactly its

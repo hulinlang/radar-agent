@@ -432,7 +432,8 @@ int main(int argc, char** argv) {
             ck(cudaMemcpy(dqs, qsv.data(), qs_bytes, cudaMemcpyHostToDevice), "memcpy qs");
             ck(cudaMemcpy(dds, dsv.data(), ds_bytes, cudaMemcpyHostToDevice), "memcpy ds");
             ri::gpuq::gemv_q4k_q8_1(dw, dqs, dds, dy, static_cast<int>(m.in),
-                                    static_cast<int>(m.out), static_cast<int>(m.ncol));
+                                    static_cast<int>(m.out), static_cast<int>(m.ncol),
+                                    static_cast<int>(m.ncol));
             std::vector<float> cg(got.size());
             ck(cudaMemcpy(cg.data(), dy, cg.size() * sizeof(float), cudaMemcpyDeviceToHost),
                "memcpy y back");
