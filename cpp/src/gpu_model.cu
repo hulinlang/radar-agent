@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "gguf.h"
+#include "gpu_attn.h"
 #include "gpu_quants.h"
 #include "gpu_quants.cuh"  // gpuq::detail::q6k_at for embed_rows_q6k
 #include "model.h"  // ModelConfig
@@ -765,6 +766,16 @@ struct GpuModel::Impl {
     // default: B11/B12 kept Q6_K on the fp32 route, and this changes end-to-end
     // ids (it is a numerical change, not just an instruction swap).
     bool q6k_int8 = false;
+    // B14: RADAR_ATTN_FA = 0 (shipped kernel) | 1 (FA, tile chosen by nr -- the
+    // shipping candidate) | 2 (FA forced BR=64) | 3 (FA forced BR=32). cfgs 2/3
+    // exist so the acceptance criteria can check that the RESULT does not depend
+    // on the tiling (docs/38 §3.2).
+    //
+    // Default is 1 as of the B14 closeout: all of P1-P4 and the Tier B nets are
+    // green (docs/38 §7.10), and FA preserved the generated ids on every case
+    // tested. RADAR_ATTN_FA=0 restores the shipped kernel exactly.
+    int attn_fa = 1;
+    bool attn_fa_warned = false;
     int* d_tokens = nullptr;
     // B8b slot pool + batch decode state
     int max_batch = 1;
@@ -1084,9 +1095,36 @@ struct GpuModel::Impl {
                                                   cfg.head_dim, bt, pos_base);
             const int t_max = pos_base + nr;
             prof_begin(PH_ATTN);
-            attention_prefill<<<nr * cfg.n_head, 128, (t_max + 128) * sizeof(float), stream>>>(
-                d_qm, d_kv, d_attm, lk, lv, block_stride, head_stride, cfg.n_head, cfg.n_kv_head,
-                cfg.head_dim, bt, pos_base, scale);
+            // B14: FA route when RADAR_ATTN_FA is set. The launcher reports *why* it
+            // could not run, and we fall back to the shipped kernel here -- a real
+            // fallback, never a silent no-op (the failure mode that bit B13 4x).
+            bool fa_done = false;
+            if (attn_fa > 0) {
+                const gpua::FaStatus st = gpua::attention_prefill_fa(
+                    d_qm, d_kv, d_attm, lk, lv, block_stride, head_stride, cfg.n_head,
+                    cfg.n_kv_head, cfg.head_dim, BLOCK, bt, pos_base, nr, scale, attn_fa,
+                    stream);
+                fa_done = (st == gpua::FA_LAUNCHED);
+                if (!attn_fa_warned) {
+                    attn_fa_warned = true;
+                    if (fa_done) {
+                        std::fprintf(stderr, "[b14] FA tile: %s (first nr=%d)\n",
+                                     gpua::attention_prefill_fa_tile_name(attn_fa, nr), nr);
+                    } else {
+                        std::fprintf(stderr,
+                                     "[b14] FA refused (%s) -> shipped kernel for the rest "
+                                     "of this run\n",
+                                     st == gpua::FA_UNSUPPORTED ? "unsupported shape"
+                                                                : "dynamic smem refused");
+                    }
+                }
+                if (!fa_done) attn_fa = 0;   // stop retrying a refused config
+            }
+            if (!fa_done) {
+                attention_prefill<<<nr * cfg.n_head, 128, (t_max + 128) * sizeof(float), stream>>>(
+                    d_qm, d_kv, d_attm, lk, lv, block_stride, head_stride, cfg.n_head,
+                    cfg.n_kv_head, cfg.head_dim, bt, pos_base, scale);
+            }
             prof_end(PH_ATTN);
             prof_begin(PH_GEMV); gemv_prefill(w.wo, d_attm, d_ffnm, Q, H, nr); prof_end(PH_GEMV);
             add_many<<<(int)((static_cast<int64_t>(nr) * H + 255) / 256), 256, 0, stream>>>(
@@ -1440,6 +1478,27 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     }
     std::fprintf(stderr, "[b13] prefill width W=%d (allocated %d; RADAR_PREFILL_W)\n",
                  m->prefill_w, Impl::MAX_PREFILL);
+    // B14: RADAR_ATTN_FA selects the FA prefill attention (docs/38). The FA route is
+    // specialised for head_dim=128 and falls back (loudly, once) rather than
+    // silently no-op'ing -- a silent no-op is exactly what bit B13 four times.
+    // Note `v >= 0`: once the default is 1, `=0` has to mean OFF, and the
+    // original `v >= 1` guard would have ignored it (a default that cannot be
+    // disabled is its own bug).
+    if (const char* fa = std::getenv("RADAR_ATTN_FA")) {
+        const int v = std::atoi(fa);
+        if (v >= 0 && v <= 3) {
+            m->attn_fa = v;
+        } else {
+            std::fprintf(stderr, "[b14] ignoring RADAR_ATTN_FA=%s (want 0..3)\n", fa);
+        }
+    }
+    std::fprintf(stderr, "[b14] prefill attention = %s (head_dim=%d%s)\n",
+                 m->attn_fa == 0 ? "shipped kernel (RADAR_ATTN_FA=0)"
+                                 : "FA, K/V tile reuse (docs/38)",
+                 c.head_dim,
+                 (m->attn_fa > 0 && c.head_dim != gpua::FA_HEAD_DIM)
+                     ? "; UNSUPPORTED head_dim -> falls back to shipped"
+                     : "");
     m->q8_k = std::max(std::max(H, Q), std::max(KV, FF));
     CU_CHECK(cudaMalloc(&m->d_q8s, static_cast<size_t>(MC) * m->q8_k));
     CU_CHECK(cudaMalloc(&m->d_q8ds,

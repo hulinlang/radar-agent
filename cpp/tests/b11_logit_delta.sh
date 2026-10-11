@@ -8,6 +8,13 @@
 #
 # Requires the CUDA-path RADAR_DEBUG_TOPK dump (added in B11).
 #
+# The two routes under comparison are overridable, because the same measurement is
+# what B14 needs (FA attention on vs off) -- and in both cases the question is the
+# same: did the perturbation exceed the top1-top2 margin anywhere?
+#   RADAR_DELTA_ENV_A  extra env for route A (default: the current defaults)
+#   RADAR_DELTA_ENV_B  extra env for route B (default: RADAR_Q4_FP32_ACT=1)
+#   RADAR_DELTA_LABEL  what the A/B labels mean (default: int8 vs fp32 activations)
+#
 #   bash /mnt/f/Qwen3-2B - dsh/radar-agent/cpp/tests/b11_logit_delta.sh
 set -uo pipefail
 
@@ -17,6 +24,9 @@ BUILD="${RADAR_INFER_BUILD:-$HOME/radar-infer-build-$SRC_ID}"
 Q4="${RADAR_B11_MODEL:-$HOME/models/qwen3vl-sft-Q4_K_M.gguf}"
 BIN="$BUILD/radar-infer"
 TMP=/tmp/radar_b11_delta
+ENV_A="${RADAR_DELTA_ENV_A:-}"
+ENV_B="${RADAR_DELTA_ENV_B:-RADAR_Q4_FP32_ACT=1}"
+LABEL="${RADAR_DELTA_LABEL:-int8 vs fp32 activations}"
 mkdir -p "$TMP"
 
 python3 - "$TMP" <<'PY'
@@ -33,13 +43,13 @@ for k, v in prompts.items():
     (d / (k + ".txt")).write_text(v, encoding="utf-8")
 PY
 
-echo "=== D4: logit displacement, int8 vs fp32 activations (top-5 dumped per step) ==="
+echo "=== D4: logit displacement, $LABEL (top-5 dumped per step) ==="
 printf '%-6s %-7s %-11s %-11s %-11s %-9s %-9s %s\n' \
   prompt steps 'max|dtop1|' 'max|dmarg|' 'min_margA' 'min_margB' ratio flips
 for p in p1 p2 p3 p4 p5; do
-  RADAR_DEBUG_TOPK=5 "$BIN" --model "$Q4" --prompt-file "$TMP/$p.txt" --backend cuda \
-      --n-predict 40 > /dev/null 2> "$TMP/$p.int8.log"
-  RADAR_DEBUG_TOPK=5 RADAR_Q4_FP32_ACT=1 "$BIN" --model "$Q4" --prompt-file "$TMP/$p.txt" \
+  env $ENV_A RADAR_DEBUG_TOPK=5 "$BIN" --model "$Q4" --prompt-file "$TMP/$p.txt" \
+      --backend cuda --n-predict 40 > /dev/null 2> "$TMP/$p.int8.log"
+  env $ENV_B RADAR_DEBUG_TOPK=5 "$BIN" --model "$Q4" --prompt-file "$TMP/$p.txt" \
       --backend cuda --n-predict 40 > /dev/null 2> "$TMP/$p.fp32.log"
   grep '^step ' "$TMP/$p.int8.log" > "$TMP/$p.a" || true
   grep '^step ' "$TMP/$p.fp32.log" > "$TMP/$p.b" || true

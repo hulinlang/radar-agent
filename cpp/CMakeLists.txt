@@ -67,7 +67,7 @@ if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   find_package(CUDAToolkit)
   add_library(radar_gpu STATIC src/gpu_model.cu src/gpu_quants.cu src/gpu_mma.cu
-                              src/gpu_q6k_int8.cu)
+                              src/gpu_q6k_int8.cu src/gpu_attn.cu)
   set_target_properties(radar_gpu PROPERTIES
     CUDA_STANDARD 17 CUDA_ARCHITECTURES "89" POSITION_INDEPENDENT_CODE ON)
   target_include_directories(radar_gpu PRIVATE src)
