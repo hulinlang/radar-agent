@@ -195,4 +195,146 @@ void matvec_q6_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
     }
 }
 
+// ---------------------------------------------------------------- B12 step 3
+// m16n8k32 with 8-bit operands: A is 16x32 int8 (row-major), B is 32x8 int8
+// (column-major), C/D is 16x8 int32. Each 32-bit register holds 4 int8 along K.
+// lane = gid*4 + tig, gid = lane>>2, tig = lane&3.
+namespace {
+
+inline void mma_a_map(int lane, int reg, int b, int* row, int* k) {
+    const int gid = lane >> 2, tig = lane & 3;
+    *row = gid + ((reg & 1) ? 8 : 0);
+    *k = ((reg >> 1) ? 16 : 0) + tig * 4 + b;
+}
+
+inline void mma_b_map(int lane, int reg, int b, int* k, int* col) {
+    const int gid = lane >> 2, tig = lane & 3;
+    *k = (reg ? 16 : 0) + tig * 4 + b;
+    *col = gid;
+}
+
+inline void mma_c_map(int lane, int reg, int* row, int* col) {
+    const int gid = lane >> 2, tig = lane & 3;
+    *row = gid + ((reg >= 2) ? 8 : 0);
+    *col = tig * 2 + (reg & 1);
+}
+
+}  // namespace
+
+bool mma_fragment_coverage_ok() {
+    {   // A: 32 lanes x 4 regs x 4 bytes = 512 = 16 x 32
+        int seen[16][32] = {};
+        for (int lane = 0; lane < 32; ++lane)
+            for (int reg = 0; reg < 4; ++reg)
+                for (int b = 0; b < 4; ++b) {
+                    int r, k;
+                    mma_a_map(lane, reg, b, &r, &k);
+                    if (r < 0 || r >= 16 || k < 0 || k >= 32) return false;
+                    if (++seen[r][k] != 1) return false;
+                }
+    }
+    {   // B: 32 x 2 x 4 = 256 = 32 x 8
+        int seen[32][8] = {};
+        for (int lane = 0; lane < 32; ++lane)
+            for (int reg = 0; reg < 2; ++reg)
+                for (int b = 0; b < 4; ++b) {
+                    int k, c;
+                    mma_b_map(lane, reg, b, &k, &c);
+                    if (k < 0 || k >= 32 || c < 0 || c >= 8) return false;
+                    if (++seen[k][c] != 1) return false;
+                }
+    }
+    {   // C/D: 32 x 4 = 128 = 16 x 8
+        int seen[16][8] = {};
+        for (int lane = 0; lane < 32; ++lane)
+            for (int reg = 0; reg < 4; ++reg) {
+                int r, c;
+                mma_c_map(lane, reg, &r, &c);
+                if (r < 0 || r >= 16 || c < 0 || c >= 8) return false;
+                if (++seen[r][c] != 1) return false;
+            }
+    }
+    return true;
+}
+
+void matvec_q4_k_q8_1_mma_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
+                               float* y, int in, int out, int ncol) {
+    const int nb = in / QK_K;
+    const size_t row_bytes = static_cast<size_t>(nb) * Q4K_BLOCK_BYTES;
+    // Row tiles of 16 and column tiles of 8 = exactly one MMA's M and N.
+    for (int rt = 0; rt < out; rt += 16) {
+        const int nr = std::min(16, out - rt);
+        for (int ct = 0; ct < ncol; ct += 8) {
+            const int nc = std::min(8, ncol - ct);
+            std::vector<float> acc(static_cast<size_t>(nr) * nc, 0.0f);
+            for (int b = 0; b < nb; ++b) {
+                // Per (row,col) partials, reset each super-block, exactly as the
+                // layout-agnostic reference does -- the fp32 parenthesisation and
+                // the j/b accumulation order are part of the spec.
+                std::vector<float> sd(static_cast<size_t>(nr) * nc, 0.0f);
+                std::vector<float> sm(static_cast<size_t>(nr) * nc, 0.0f);
+                for (int j = 0; j < 8; ++j) {
+                    // ---- A tile, gathered through the fragment map ----
+                    // sub-block j covers k' = j*32 .. j*32+31, i.e. exactly K=32.
+                    int8_t A[16][32];
+                    for (int lane = 0; lane < 32; ++lane)
+                        for (int reg = 0; reg < 4; ++reg)
+                            for (int bb = 0; bb < 4; ++bb) {
+                                int r, k;
+                                mma_a_map(lane, reg, bb, &r, &k);
+                                const uint8_t* sb =
+                                    w + static_cast<size_t>(rt + r) * row_bytes +
+                                    static_cast<size_t>(b) * Q4K_BLOCK_BYTES;
+                                const uint8_t* qsj = sb + 16 + (j >> 1) * 32;
+                                A[r][k] = static_cast<int8_t>((qsj[k] >> ((j & 1) * 4)) & 0xF);
+                            }
+                    // ---- B tile, gathered through the fragment map ----
+                    int8_t B[32][8];
+                    for (int lane = 0; lane < 32; ++lane)
+                        for (int reg = 0; reg < 2; ++reg)
+                            for (int bb = 0; bb < 4; ++bb) {
+                                int k, c;
+                                mma_b_map(lane, reg, bb, &k, &c);
+                                if (ct + c < ncol)
+                                    B[k][c] = qs[q8_index(b * 8 + j, ct + c, k, ncol)];
+                            }
+                    // ---- the MMA's own arithmetic: exact int32 dot per output ----
+                    for (int r = 0; r < nr; ++r) {
+                        const uint8_t* sb = w + static_cast<size_t>(rt + r) * row_bytes +
+                                            static_cast<size_t>(b) * Q4K_BLOCK_BYTES;
+                        // d4/dmin are per (row, super-block) and are applied after
+                        // the j loop, exactly as the reference does.
+                        uint8_t sc, m;
+                        get_scale_min_k4(j, sb + 4, &sc, &m);
+                        for (int n = 0; n < nc; ++n) {
+                            int32_t dot1 = 0;
+                            for (int k = 0; k < 32; ++k) dot1 += A[r][k] * B[k][n];
+                            const int32_t dot2 =
+                                ds[static_cast<size_t>(b * 8 + j) * ncol + ct + n].sum_q;
+                            const float d8 = ds[static_cast<size_t>(b * 8 + j) * ncol + ct + n].d;
+                            const size_t o = static_cast<size_t>(r) * nc + n;
+                            sd[o] += d8 * static_cast<float>(dot1 * static_cast<int32_t>(sc));
+                            sm[o] += d8 * static_cast<float>(dot2 * static_cast<int32_t>(m));
+                        }
+                    }
+                }
+                for (int r = 0; r < nr; ++r) {
+                    const uint8_t* sb = w + static_cast<size_t>(rt + r) * row_bytes +
+                                        static_cast<size_t>(b) * Q4K_BLOCK_BYTES;
+                    const float d4 = f16_to_f32(load_f16_bits(sb));
+                    const float dmin = f16_to_f32(load_f16_bits(sb + 2));
+                    for (int n = 0; n < nc; ++n) {
+                        const size_t o = static_cast<size_t>(r) * nc + n;
+                        acc[o] += d4 * sd[o] - dmin * sm[o];
+                    }
+                }
+            }
+            for (int r = 0; r < nr; ++r)
+                for (int n = 0; n < nc; ++n)
+                    y[static_cast<size_t>(ct + n) * out + rt + r] =
+                        acc[static_cast<size_t>(r) * nc + n];
+        }
+    }
+}
+
 }  // namespace ri

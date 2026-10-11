@@ -109,6 +109,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     int fails = 0;
+    // B12 step 3: the fragment mapping must be a bijection before anything that
+    // depends on it can be trusted. Numeric-independent, so check it once.
+    {
+        const bool cov = ri::mma_fragment_coverage_ok();
+        std::printf("mma fragment maps  A 16x32 / B 32x8 / C 16x8  %s\n",
+                    cov ? "BIJECTIVE" : "NOT A BIJECTION");
+        if (!cov) ++fails;
+    }
     try {
         const Meta m = read_meta(argv[2]);
         if (m.in <= 0 || m.in % 256 != 0 || m.ncol <= 0 || m.nrow <= 0) {
@@ -226,6 +234,44 @@ int main(int argc, char** argv) {
 
         std::printf("     numpy: int8 vs fp32-activation %.3e ; vs dequant-activation %.3e\n",
                     m.rel_act, m.rel_ord);
+
+        // ---- 2b. B12 step 3: the SAME gemv, but every A/B element fetched
+        //         through the m16n8k32 fragment map. Must be bit-exact against the
+        //         same reference payload: a wrong lane mapping still produces an
+        //         *exact* dot, so only this comparison can catch it.
+        if (m.type == 12) {
+            std::vector<float> gotm(static_cast<size_t>(m.ncol) * m.out);
+            ri::matvec_q4_k_q8_1_mma_host(raw, qsv.data(), dsv.data(), gotm.data(),
+                                          static_cast<int>(m.in), static_cast<int>(m.out),
+                                          static_cast<int>(m.ncol));
+            const float* ref = reinterpret_cast<const float*>(yb.data());
+            size_t first = 0, bad = 0;
+            double maxabs = 0.0, worst = 0.0;
+            size_t worst_c = 0, worst_r = 0;
+            for (long c = 0; c < m.ncol; ++c) {
+                for (long r = 0; r < m.nrow; ++r) {
+                    const float a = gotm[static_cast<size_t>(c) * m.out + r];
+                    const float b = ref[static_cast<size_t>(r) * m.ncol + c];
+                    if (std::memcmp(&a, &b, 4) != 0) {
+                        if (bad == 0) first = static_cast<size_t>(c) * m.out + r;
+                        ++bad;
+                        const double d = std::fabs(static_cast<double>(a) - b);
+                        if (d > maxabs) { maxabs = d; worst_c = c; worst_r = r; }
+                    }
+                }
+            }
+            worst = m.y_scale > 0 ? maxabs / m.y_scale : maxabs;
+            if (bad == 0) {
+                std::printf("host Q4_K int8 gemv via MMA FRAGMENTS  %ld x %ld x %ld  BIT-EXACT\n",
+                            m.ncol, m.in, m.out);
+            } else {
+                std::printf("host Q4_K int8 gemv via MMA FRAGMENTS  MISMATCH %zu/%ld elems, "
+                            "first idx %zu, max|d|=%.6g (%.2e of y_scale) at col %zu row %zu\n",
+                            bad, static_cast<long>(m.nrow) * m.ncol, first, maxabs, worst,
+                            worst_c, worst_r);
+                ++fails;
+            }
+        }
 
 #if defined(USE_CUDA)
         // ---- 3. CUDA int8 path, bit-exact vs the same reference ----

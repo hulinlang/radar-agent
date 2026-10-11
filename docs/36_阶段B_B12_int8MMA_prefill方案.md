@@ -252,10 +252,11 @@ B11 的 d_q8s/d_q8ds（已是 int8）──load──> B 分片 ─────�
 
    ⇒ 新建一份"MMA 参考"只会算出**同样的数字**，属于重复。B12 新增的不是数学，
    而是**物理布局**（哪条 lane 拿哪个元素）与**解包**。
-3. **host 侧语义原型**：在 CPU 上实现**分片映射 + 解包**，与 B11 参考 bit-exact。
+3. ✅ **host 侧语义原型**（2026-10-11 完成）：`ri::matvec_q4_k_q8_1_mma_host` +
+   `ri::mma_fragment_coverage_ok`（`cpp/src/int8_act.{h,cpp}`），挂进 `int8_ref_test`。
    ⚠️ 关键：B11 参考是**逻辑索引、布局无关**的，所以它**抓不到 lane 映射写错**
-   （映射错了照样是一个"精确但错误"的 dot）。因此原型必须**按物理布局取数**再算，
-   这才是能抓映射错误的层①。**在写 CUDA 之前把语义钉死。**
+   （映射错了照样是一个"精确但错误"的 dot）。因此原型**按物理布局取数**再算 ——
+   这才是能抓映射错误的层①。**结果见 §7.6。**
 4. **CUDA kernel**：`gpu_mma.cu`，先在固定 tile 下与 host 原型 bit-exact
 5. **chunk 放大**（§3.5 选项 A）：`MAX_MC` 16 → 64，逐项核对 §2.2(c)
 6. **接入引擎**：`gemv_prefill` 分派；先 Q4_K，Q6_K 不动
@@ -423,3 +424,38 @@ Q8_1 的 `d/sum_q` 再加 0.85 MB。
    而 `gemv_mc` 各列独立、与单列 bitwise 相同（B8 已验证）。只要 N 方向加宽
    不改变 k 循环与 fp32 尾声的顺序，**逐位相同就该成立**。这条要用 §1.2 的 exact
    档案实测确认，但它是"可构造保证"而不是"听天由命"。
+
+### 7.6 ✅ 步骤 3：host 分片原型（2026-10-11）
+
+新增 `cpp/src/int8_act.{h,cpp}`：
+
+| 产物 | 作用 |
+|---|---|
+| `mma_a_map` / `mma_b_map` / `mma_c_map` | `m16n8k32`（8-bit）的 PTX 分片映射（`gid = lane>>2`、`tig = lane&3`） |
+| `mma_fragment_coverage_ok()` | 证明三张分片映射各是**双射**（16×32 / 32×8 / 16×8 每格恰好被覆盖一次）—— 与数值无关，能独立抓"映射不是双射"这类错误 |
+| `matvec_q4_k_q8_1_mma_host()` | 与 `matvec_q4_k_q8_1_host` **同数学**，但每个 A/B 元素都**经分片映射取数** |
+
+**实测结果**（`int8-ref-test`，4 个 Q4_K 张量，零编译警告）：
+
+```
+mma fragment maps  A 16x32 / B 32x8 / C 16x8  BIJECTIVE
+host Q4_K int8 gemv via MMA FRAGMENTS  16 x 2048 x 1024  BIT-EXACT   (attn_k)
+                                       16 x 2048 x 2048  BIT-EXACT   (attn_output)
+                                       16 x 2048 x 2048  BIT-EXACT   (attn_q)
+                                       16 x 2048 x 6144  BIT-EXACT   (ffn_up)
+```
+
+**这一步买到了什么：**
+
+1. ⭐ **PTX 的 lane 映射被证实是对的** —— 而且是**逐位**证实的，不是"看起来对"。
+   映射若写错（行错位、k 内序错、寄存器序错），取数就会配错乘积，
+   于是**对不上布局无关的参考**。所以这条 bit-exact 同时验证了映射与解包。
+2. **一个可在写 CUDA 之前独立运行的层①**：`int8-ref-test` 现在同时跑
+   参考实现与分片实现；CUDA kernel 写完后只要与**分片原型**逐位一致，
+   映射就自动是对的（不必再和 NumPy 比一次）。
+3. **确认 `K=32` 的对应关系**：B11 的 Q4_K 子块 `j`（32 个值）**正好**是 MMA 的 K=32，
+   一条 MMA 覆盖一个子块 × 16 行 × 8 列。`ffn_up` 的 `out=6144` 验证了大 out
+   （6144/16 = 384 个 row-tile）；尾块逻辑（`out`/`ncol` 非 16/8 整数倍）已在原型里处理。
+
+> **下一步（步骤 4）**：写 `gpu_mma.cu`，**N 可变**（`W` 后置），
+> 要求与 `matvec_q4_k_q8_1_mma_host` **逐位一致**。

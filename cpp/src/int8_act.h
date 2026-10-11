@@ -54,4 +54,27 @@ void matvec_q4_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
 void matvec_q6_k_q8_1_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
                            float* y, int in, int out, int ncol);
 
+// ---------------------------------------------------------------- B12 step 3
+// Fragment-mapped twin of matvec_q4_k_q8_1_host (docs/36 section 3.3 / step 3).
+//
+// Same math, but every A and B element is fetched THROUGH the m16n8k32 (8-bit)
+// register-fragment mapping instead of by logical index. That is the whole point:
+// the plain host reference is layout-agnostic, so it cannot catch a wrong lane
+// mapping (a wrong mapping still yields an *exact* but wrong dot). This twin is
+// the oracle the CUDA kernel must match bit-exactly, and it is itself checked
+// bit-exactly against the layout-agnostic reference.
+//
+// K = 32 is not a coincidence: it is exactly one Q4_K sub-block (j in 0..7),
+// so one MMA covers one sub-block of 16 rows x 8 columns.
+//
+// Mapping is the PTX ISA's; `mma_fragment_coverage_ok()` proves it is a bijection
+// over the 16x32 / 32x8 / 16x8 tiles, so the gather below is complete by
+// construction (and an incomplete gather cannot silently pass).
+void matvec_q4_k_q8_1_mma_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
+                               float* y, int in, int out, int ncol);
+
+// True iff the A (16x32), B (32x8) and C (16x8) fragment maps each cover their
+// tile exactly once. A cheap, numeric-independent check of the mapping itself.
+bool mma_fragment_coverage_ok();
+
 }  // namespace ri
