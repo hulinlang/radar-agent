@@ -12,16 +12,16 @@
 
 project:
   name: radar-agent
-  root: "F:/Qwen3-2B/radar-agent"        # 项目根（绝对路径，统一在此声明）
+  root: "F:/Qwen3-2B - dsh/radar-agent"        # 项目根（绝对路径，统一在此声明）
   seed: 42
   log_level: INFO
 
 paths:
   # ---- 基座模型（HF 格式）：不搬移，只引用（§4.1）----
-  model_base_dir: "F:/Qwen3-2B/dir"      # Qwen3-VL-2B-Instruct 权重所在目录
+  model_base_dir: "F:/Qwen3-2B - dsh/dir"      # Qwen3-VL-2B-Instruct 权重所在目录
   # ---- 数据 ----
-  data_raw:        "F:/Qwen3-2B/radar-agent/data_raw"        # 原始 PDF/教材，只读
-  data_processed:  "F:/Qwen3-2B/radar-agent/data_processed"  # 解析/切分产物
+  data_raw:        "F:/Qwen3-2B - dsh/radar-agent/data_raw"        # 原始 PDF/教材，只读
+  data_processed:  "F:/Qwen3-2B - dsh/radar-agent/data_processed"  # 解析/切分产物
   # ---- P4 检索（新增）----
   # ⚠️ 用**相对路径**：load_config() 会把它们按 project.root 解析成绝对路径。
   #    写成绝对路径 = 又把 root 抄一遍 = 「同一参数两处定义」，违反 §4.6。
@@ -43,12 +43,12 @@ paths:
   paper_eval_file: "data_processed/eval/paper_retrieval_eval.jsonl"
   web_snapshot:    "data_processed/web_snapshot.jsonl"       # P6 web_search 离线快照
   # ---- 引擎相关模型资产（GGUF / mmproj / merged）：与 HF 权重物理隔离 ----
-  models_gguf:     "F:/Qwen3-2B/radar-agent/models/gguf"
-  models_merged:   "F:/Qwen3-2B/radar-agent/models/merged"
+  models_gguf:     "F:/Qwen3-2B - dsh/radar-agent/models/gguf"
+  models_merged:   "F:/Qwen3-2B - dsh/radar-agent/models/merged"
   # ---- 产物 ----
-  outputs: "F:/Qwen3-2B/radar-agent/outputs"
-  reports: "F:/Qwen3-2B/radar-agent/reports"
-  logs:    "F:/Qwen3-2B/radar-agent/logs"
+  outputs: "F:/Qwen3-2B - dsh/radar-agent/outputs"
+  reports: "F:/Qwen3-2B - dsh/radar-agent/reports"
+  logs:    "F:/Qwen3-2B - dsh/radar-agent/logs"
 
 # -----------------------------------------------------------------------------
 # 模型"身份"：引擎无关的事实（P0 实测确认）。

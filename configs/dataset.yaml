@@ -11,7 +11,7 @@ spec_version: "0.2"
 # 模型侧常量（实测来源：logs/probe/p3_chat_template_probe.txt）
 # ---------------------------------------------------------------------------
 model:
-  tokenizer_dir: "F:/Qwen3-2B/dir"
+  tokenizer_dir: "F:/Qwen3-2B - dsh/dir"
 
   # 双信源交叉校验：运行时从 tokenizer 读出真实 id 集合，与本列表比对；
   # 不一致即报 critical —— 防止"模型换了但常量没换"这类静默错误。

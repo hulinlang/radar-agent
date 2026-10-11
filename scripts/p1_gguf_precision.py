@@ -15,8 +15,8 @@ import json
 import struct
 from pathlib import Path
 
-GGUF_DIR = Path(r"F:\Qwen3-2B\radar-agent\models\gguf")
-MANIFEST = Path(r"F:\Qwen3-2B\radar-agent\logs\p1_assets_manifest.json")
+GGUF_DIR = Path(r"F:\Qwen3-2B - dsh\radar-agent\models\gguf")
+MANIFEST = Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\p1_assets_manifest.json")
 
 T_UINT8, T_INT8, T_UINT16, T_INT16 = 0, 1, 2, 3
 T_UINT32, T_INT32, T_FLOAT32, T_BOOL = 4, 5, 6, 7
@@ -163,5 +163,5 @@ out.append("     ① 分子应为**语言侧**权重（3.441 GB），视觉塔�
 out.append("     ② 分母应为**本机实际文件**（1.107 GB），而非社区仓库页面的 1.2 GB。")
 
 txt = "\n".join(out)
-Path(r"F:\Qwen3-2B\radar-agent\logs\p1_gguf_precision.txt").write_text(txt, encoding="utf-8")
+Path(r"F:\Qwen3-2B - dsh\radar-agent\logs\p1_gguf_precision.txt").write_text(txt, encoding="utf-8")
 print(txt)

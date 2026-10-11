@@ -23,7 +23,7 @@ import os
 import re
 import yaml
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
 AUTHORED = os.path.join(ROOT, "data_authored")
 OUT = os.path.join(ROOT, "reports", "P3_去污染检测.md")
 EXCLUDE = {"p2_alltasks_v0.yaml", "_draft_form_demo.yaml"}

@@ -15,8 +15,8 @@ import argparse, io, os, json, time
 import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
-MODEL = r"F:\Qwen3-2B\dir"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
+MODEL = r"F:\Qwen3-2B - dsh\dir"
 EVAL = os.path.join(ROOT, "data_processed", "sft_v1", "eval_frozen.jsonl")
 IM_END = 151645
 

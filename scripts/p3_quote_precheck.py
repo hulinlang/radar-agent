@@ -28,7 +28,7 @@ import os
 import re
 import sys
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
 CORPUS_JSONL = os.path.join(ROOT, "data_processed", "corpus", "book_sections.jsonl")
 MMWAVE = os.path.join(ROOT, "data_raw", "mmWave_Insight")
 DEFAULT_OUT = os.path.join(ROOT, "logs", "probe", "_quote_precheck.txt")

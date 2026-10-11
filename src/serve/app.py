@@ -46,21 +46,27 @@ SAMPLES = [
 
 
 class Engine:
-    """持有模型 / 分词器 / 工具 / 语料。进程内单例。"""
+    """持有模型 / 分词器 / 工具 / 语料。进程内单例。
 
-    def __init__(self, adapter: str | None = None, embed_cpu: bool = False):
+    backend:
+      "hf"       —— 原形态：进程内加载 HF 权重（可挂 LoRA 适配器）。
+      "llamacpp" —— P10 部署形态：不加载模型权重，生成走外部 llama-server
+                   （GGUF，见 src/engines/react_llamacpp.py）。tokenizer 仍加载
+                   （MB 级），因为 chat 模板在 Python 侧渲染。
+    """
+
+    def __init__(self, adapter: str | None = None, embed_cpu: bool = False,
+                 backend: str = "hf", llama_url: str = "http://127.0.0.1:8080"):
         import yaml
         from transformers import AutoTokenizer
 
         from src.agent.react import DEFAULTS as REACT_DEFAULTS
         from src.agent.react import tool_call_bad_ids
-        from src.modeling import load_model
         from src.retrieval.index import load_corpus
         from src.tools import corpus_search
         from src.tools.registry import to_openai_tools
 
-        import torch  # noqa: F401
-
+        self.backend = backend
         self.cfg = load_config()
         acfg = yaml.safe_load(
             (PROJECT_ROOT / "configs" / "agent.yaml").read_text(encoding="utf-8"))
@@ -77,18 +83,27 @@ class Engine:
 
         self.tok = AutoTokenizer.from_pretrained(
             self.cfg["paths"]["model_base_dir"], trust_remote_code=False)
-        self.model, self.impl, _ = load_model(
-            self.cfg["paths"]["model_base_dir"], dtype="bfloat16", device="cuda")
 
-        if adapter:
-            from peft import PeftModel
-            ap = Path(adapter)
-            if not ap.is_absolute():
-                ap = PROJECT_ROOT / ap
-            self.model = PeftModel.from_pretrained(self.model, str(ap))
-            self.adapter = ap.name
+        if backend == "llamacpp":
+            from src.engines.react_llamacpp import LlamaCppGenBackend
+            self.gen_backend = LlamaCppGenBackend(self.tok, base_url=llama_url)
+            self.model, self.impl = None, "llamacpp(外部服务)"
+            self.adapter = Path(adapter).name if adapter else "gguf-sft"
         else:
-            self.adapter = None
+            from src.modeling import load_model
+            import torch  # noqa: F401
+            self.gen_backend = None
+            self.model, self.impl, _ = load_model(
+                self.cfg["paths"]["model_base_dir"], dtype="bfloat16", device="cuda")
+            if adapter:
+                from peft import PeftModel
+                ap = Path(adapter)
+                if not ap.is_absolute():
+                    ap = PROJECT_ROOT / ap
+                self.model = PeftModel.from_pretrained(self.model, str(ap))
+                self.adapter = ap.name
+            else:
+                self.adapter = None
 
         self.bad = tool_call_bad_ids(self.tok)
 
@@ -135,7 +150,7 @@ class Engine:
             return r
 
         rr = react(q, model=self.model, tok=self.tok, tools_spec=self.tools_spec,
-                   bad_ids=self.bad, execute=timed)
+                   bad_ids=self.bad, execute=timed, gen_backend=self.gen_backend)
         steps = [{
             "step": s.step, "status": s.status,
             "calls": s.calls, "observations": s.observations,
@@ -154,25 +169,31 @@ class Engine:
 
         ⚠️ 必须屏蔽 `<tool_call>`：没有工具可执行时让它输出调用块 = 无效答案。
         """
-        import torch
         from src.agent.prompts import SYSTEM_PLAIN
 
         msgs = [{"role": "system", "content": SYSTEM_PLAIN}, {"role": "user", "content": q}]
-        prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        ids = self.tok(prompt, return_tensors="pt").to(self.model.device)
         t = time.perf_counter()
-        with torch.no_grad():
-            out = self.model.generate(**ids, max_new_tokens=512, do_sample=False,
-                                      pad_token_id=self.tok.pad_token_id,
-                                      eos_token_id=self.tok.eos_token_id,
-                                      bad_words_ids=self.bad)
+        if self.gen_backend is not None:
+            # llama-server 路径：is_last=True → 全程屏蔽 <tool_call>（logit_bias）
+            seg, n_new = self.gen_backend(msgs, None, 512, True)
+        else:
+            import torch
+            prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            ids = self.tok(prompt, return_tensors="pt").to(self.model.device)
+            with torch.no_grad():
+                out = self.model.generate(**ids, max_new_tokens=512, do_sample=False,
+                                          pad_token_id=self.tok.pad_token_id,
+                                          eos_token_id=self.tok.eos_token_id,
+                                          bad_words_ids=self.bad)
+            seg = self.tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=False)
+            cut = seg.find("<|im_end|>")
+            seg = seg[:cut] if cut >= 0 else seg
+            n_new = int(out.shape[1] - ids["input_ids"].shape[1])
         wall = (time.perf_counter() - t) * 1000.0
-        seg = self.tok.decode(out[0][ids["input_ids"].shape[1]:], skip_special_tokens=False)
-        cut = seg.find("<|im_end|>")
         return {
-            "mode": "plain", "answer": (seg[:cut] if cut >= 0 else seg).strip(),
+            "mode": "plain", "answer": seg.strip(),
             "steps": [], "counters": {}, "wall_ms": round(wall, 1),
-            "tool_ms": 0.0, "tokens": int(out.shape[1] - ids["input_ids"].shape[1]),
+            "tool_ms": 0.0, "tokens": n_new,
         }
 
     # ---------------- 引用 ----------------
@@ -210,12 +231,14 @@ class AskIn(BaseModel):
     mode: str = "rag"
 
 
-def build_app(adapter: str | None, embed_cpu: bool = False):
+def build_app(adapter: str | None, embed_cpu: bool = False,
+              backend: str = "hf", llama_url: str = "http://127.0.0.1:8080"):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse
 
     app = FastAPI(title="radar-agent 演示", version="1.0")
-    eng = Engine(adapter=adapter, embed_cpu=embed_cpu)
+    eng = Engine(adapter=adapter, embed_cpu=embed_cpu,
+                 backend=backend, llama_url=llama_url)
 
     @app.on_event("startup")
     async def _warm():
@@ -224,6 +247,7 @@ def build_app(adapter: str | None, embed_cpu: bool = False):
     @app.get("/api/health")
     def health():
         return {"ready": eng.ready, "adapter": eng.adapter, "impl": eng.impl,
+                "backend": eng.backend,
                 "n_chunks": eng.n_chunks, "corpus_ok": eng.corpus_ok, "tools": eng.tool_names,
                 "warm_ok": getattr(eng, "warm_ok", None),
                 "warm_s": round(getattr(eng, "warm_s", 0.0), 1)}

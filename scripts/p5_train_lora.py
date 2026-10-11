@@ -20,8 +20,8 @@ from torch.utils.data import Dataset
 from transformers import (AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration,
                           Trainer, TrainingArguments, TrainerCallback)
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
-MODEL = r"F:\Qwen3-2B\dir"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
+MODEL = r"F:\Qwen3-2B - dsh\dir"
 IM_END = 151645  # <|im_end|>（P0 实测，勿按 base 版惯例推断成 151643）
 
 LANG_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]

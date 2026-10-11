@@ -1,7 +1,7 @@
 """验证新增公式：数量、可计算性、数值正确性（对照手算与语料给出的数值例子）。"""
 import sys
 
-sys.path.insert(0, r"F:\Qwen3-2B\radar-agent")
+sys.path.insert(0, r"F:\Qwen3-2B - dsh\radar-agent")
 from src.dataset import formulas
 
 print("公式总数: %d（原 11 + 新增 %d）" % (len(formulas.REGISTRY), len(formulas.REGISTRY) - 11))

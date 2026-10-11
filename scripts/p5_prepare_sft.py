@@ -10,7 +10,7 @@ P5 Phase 0：把 data_processed/datasets 下的编译产物合并成训练/评�
 """
 import io, os, json, glob, hashlib, collections
 
-ROOT = r"F:\Qwen3-2B\radar-agent"
+ROOT = r"F:\Qwen3-2B - dsh\radar-agent"
 DS = os.path.join(ROOT, "data_processed", "datasets")
 OUT = os.path.join(ROOT, "data_processed", "sft_v1")
 os.makedirs(OUT, exist_ok=True)

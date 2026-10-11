@@ -1,0 +1,28 @@
+# =============================================================================
+# P10 对照配置：微调版 **F16** GGUF × llama-server
+#
+# 用途（docs/19 §4.2）：与 deploy_gguf.yaml（Q4_K_M）构成**同引擎单变量对照**——
+# 同一 llama-server（Windows Vulkan b10951）、同一批 200 题、同一判分口径 v3，
+# 只差量化一档，用于回答"Q4_K_M 到底丢了多少精度"。
+# =============================================================================
+
+engine:
+  name: llamacpp
+  display: "llama.cpp SFT F16 (llama-server)"
+
+binary:
+  bin_dir: "%LOCALAPPDATA%/Microsoft/WinGet/Packages/ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe"
+
+model:
+  llm_path:    "${paths.models_gguf}/qwen3vl-sft-f16.gguf"
+  mmproj_path: "${paths.models_gguf}/mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+
+server:
+  host: "127.0.0.1"
+  port: 8081        # 避开 WSL2 CUDA 服务的 8080（localhost 转发占用）
+  startup_timeout_s: 300
+  device: "Vulkan0"
+  n_gpu_layers: 99
+  ctx_size: 8192
+  parallel: 1
+  flash_attn: true

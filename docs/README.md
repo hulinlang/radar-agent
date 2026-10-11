@@ -1,7 +1,7 @@
 # radar-agent 项目文档导航
 
 > 项目：**Qwen3-VL-2B-Instruct 雷达领域 RAG + Agent 系统**（学习型项目）
-> 最后更新：2026-09-21
+> 最后更新：2026-10-05
 > 来源：本文档由 `plan.txt`（8 阶段流程）转化而来，并补了一个前置的 P0 环节。
 
 ---
@@ -21,6 +21,61 @@
 > **做了但没成功的事（负面结果与归因）**、以及"收益天花板在数据和模型、不在检索"这个核心判断。
 > 换新窗口时只需说："读 `radar-agent/docs/00_行为规范.md` 和 `radar-agent/docs/02_交接文档_P2.md`，开始执行 P2。"
 
+> 🎯 **校招备考三件套**（2026-09-28 新增）：
+> `docs/13_技术栈详解.md`（讲"我懂什么"·含被淘汰方案与实测归因）→
+> **`docs/14_校招技能对照与补强路线.md`（讲"我还缺什么"·含 JD 词频、缺口清单、DoD 级补课方案）**→
+> `docs/11_项目讲解素材.md`（讲"我怎么开口"）· 另有 `docs/12_面试复盘与问答.md`。
+>
+> 🆕 **`docs/31_面试知识体系_全链路与自研引擎.md`（2026-10-08 新增）** —— 把上面几份与
+> **P10 / 阶段 B 自研 C++/CUDA 引擎**合并成一套完整知识体系：
+> 14 模块知识地图（原理/取舍/数字/坑）· **自研引擎专题**（GGUF→BPE→前向→kernel 迭代→batching→服务化）·
+> 16 条追问 Q&A · 一页速查 · 「负面结果怎么讲」三纪律。
+> ⚠️ `docs/11`–`16` 写于阶段 B **之前**，**未覆盖自研引擎**；要讲"引擎层"先看 31 号。
+>
+> 🆕🆕 **`docs/32_简历两项目重组方案.md`（2026-10-10 新增）** —— 按用户拍板把简历
+> 3 条项目重整为 **2 条**（**模型微调/训练侧** + **自研推理引擎/推理侧**，GEMM 并入后者），
+> 附**可直接粘贴的文本**、**每个数字的出处表**（被追问时能立刻指出处）、
+> 8 条预判追问的答题骨架、新旧对照。删掉的天基雷达检测项目及分投建议见该文档 §1。
+>
+> 🆕 **`reports/P11_Roofline性能模型.md` + `reports/p11_roofline.png`（2026-10-10 新增）**
+> —— `docs/16` §2.2 那个「缺的桥」已补齐：`src/perf_model.py`（参数唯一来源
+> `configs/perf_model.yaml`）把算子层与引擎层的实测点放到同一张屋顶线图上。
+> ⭐ 对自研 CUDA F16 的预测与实测吻合到 **0.8%**；定量给出 decode 带宽受限的证据
+> （AI≈1.0 vs 转折点 59.3）与 prefill 的临界 prompt 长度（**≈59 token**）。
+> ⚠️ 顺带订正两处文档笔误：`docs/20` §2.3 的 KV 公式（×2B 应为 ×4B/F32）、
+> `docs/16` §2.1 的 KV 值（112 KiB → **224 KiB**）。
+>
+> 🎯🎯 **定向对标**：`docs/15_曦望JD对标与补强路线.md`（2026-09-28 新增）
+> —— 针对「曦望 Sunrise · AI 推理芯片及软硬件系统核心研发」这一家 JD 的打法：
+> JD 逐条拆解（✅/⚠️/❌）· 四个可改造方向 A–D（**A 性能建模最优先**）· 六块必补知识 K1–K6 ·
+> 90 天路线 · S3 参数切入话术 · 诚实风险评估。
+> ⚠️ 定位结论（**2026-09-29 修订**）：由「冲刺岗」上调为「**中等偏上，值得认真冲**」——
+> 初版漏看简历，把 C/C++ 与 CUDA/Triton 误判为 ❌，实际简历里已有 **CUDA/Triton GEMM 算子项目**
+> （FP32 1024³ 达 5542 GFLOPS、cuBLAS 96%、Nsight Compute 归因）。硬缺口只剩**分布式/高性能网络**一条。
+> **`docs/16_简历与JD对照及串联打法.md`**（2026-09-29 新增）：简历弹药重估 +
+> ⭐ **「算子层 → 引擎层 → 系统层」三层串联闭环**（Roofline 是中间那座桥）+
+> 手写字数被追问的自查（wave quantization）+ 简历三处修改建议 + 90 秒自我介绍主线。
+> 与 14 号的分工：14 是**通用市场面**，15 是**单点深挖**，16 是**简历 × 该岗的串联**。
+>
+> 🚀 **A 路线已实测跑通（2026-09-29）**：`docs/18_A路线WSL2加vLLM实测.md`
+> —— WSL2 黑名单已解除并装好 **Ubuntu 24.04.5 LTS**，**GPU 直通成功**（guest 内 nvidia-smi 见 RTX 4060 /
+> CUDA UMD 13.4），**vLLM 0.24.0 + torch 2.11.0+cu130 跑出中文回答**（192 token / 90.49 tok/s）。
+> ⚠️ 该吞吐**不可与 Windows 侧直接比较**（batch / 量化 / OS 层三变量同时变，见 18 号 §4）。
+> 踩了七个坑，全部记录在 18 号 §3（uv 与 pip 选项差异、torch ABI、WSL2 多进程、flashinfer 要 nvcc 等）。
+>
+> ✅ **链路断裂已修复（2026-10-05，P10）**：`docs/19_P10_Linux部署链.md`
+> —— p5b_tool6 已完整走过 `merge → GGUF → Q4_K_M → llama-server → ReAct/前端全对接`，
+> 200 题回归与 HF bf16 同口径可比，llama-server 形态快 8~15 倍。
+> 项目新方向：**基于 Linux 的 C/C++ 推理部署**（路线 A = llama.cpp 部署链 ✅；路线 B = 自研 C/C++ 引擎）。
+> 🔧 **阶段 B 已立项（2026-10-06）**：`docs/20_阶段B_B0_GGUF与Qwen3架构精读.md`
+> —— B0 产出：GGUF v3 二进制布局逐字节精读 + Qwen3-VL 文本解码器架构实测参数表 +
+> 逐层数据流 + Roofline 账 + B1–B6 里程碑与对拍验收。代码放 `radar-agent/cpp/`（独立 CMake 工程）。
+>
+> ~~⚠️ **14 号文档核实出一条链路断裂**：**P5 微调产物从未走到 GGUF 部署**——
+> P8 实际是「HF transformers bf16 进程内加载 + peft adapter」，`models/gguf/` 下只有基座权重，
+> 无任何 merge / convert / quantize 脚本。即 P1 的"部署走 llama.cpp"决策与 P8 的实际形态不一致。
+> 补链方案见 `docs/14` §5 S1。**面试前优先修这条。**~~ → **已由 P10 修复（docs/19）**
+
 ---
 
 ## 二、当前进度
@@ -37,6 +92,7 @@
 | **P4 基线 RAG 搭建** | 阶段 4 | 7 | 🟡 **S0 + S0b 切分均已完成**：① 教材 `chunks.jsonl` **2054 条**（text 917 / figure 518 / table 30 / equation 589 / mmwave 200），DoD **18/18 全绿**，连跑两次哈希一致，行内公式 1391 一条不丢，eval 教材域 quote 119/119 可溯；② **英文文献 `papers_chunks.jsonl` 1639 条**（text 1169 / figure 396 / table 53 / abstract 22），35 篇 501 页零失败，DoD **10/10 全绿**（2026-09-20，含新增 P-9/P-10 命名不变量）；③ **S1 统一索引已建成**（2026-09-20）：三源合一 `index/unified` **3659 条**（排掉 34 条 Front Matter），BM25 + bge-m3 dense + RRF + 图号第三路召回，DoD **15/15 全绿**；④ **S2 检索评测已完成**（2026-09-20）：伪标注 **174 条**，Recall@5 **75.3%** / Recall@10 **83.3%** / MRR **0.590**；**关键结论①：加入 1639 条英文文献对教材题召回零影响**（全库 vs 教材语料 MRR 差 0.001）→ D3 担心的"文献挤占 top-k"**未发生**；⑤ **两个评测缺口已补**（2026-09-20）：· **calc 题三种标注对比**（概念出处 / 公式本体 / 页码区间，见报告 §6c）——最贴合计算需求的"公式本体"标注下 **R@1=0%**，修正了"不是公式检索差"的早期结论 · **文献域检验集 33 条**（`data_processed/eval/paper_retrieval_eval.jsonl`，中文提问→英文论文）——全库 R@5 仅 **24.2%**，屏蔽中文语料后升到 33.3%（R@10 **39.4%→63.6%**）→ **中文提问被中文语料截胡 + 跨语言上限，两层原因都有**；⑥ **公式概念索引已建成但实测为负收益、默认关闭**（`configs/formula_concepts.yaml` 22 个概念；开时整体 R@1 47.7%→46.6%、MRR 0.590→0.573；代码保留，待概念表配结构指纹或 pin 改加分为止）｜ ⏳ 下一步：语言感知重排/意图路由（先扩集再定方案）· 之后进 P6 Agent | `docs/10_P4基线RAG.md`、`reports/P4_切分自检.md`、`reports/P4_论文切分自检.md`、`reports/P4_统一索引自检.md`、`reports/P4_统一索引冒烟.md`、`reports/P4_检索评测.md` |
 | **P6 集成与 Agent** | 阶段 6 | 8 | 🟡 **工具层 + 解析层 + 主循环 + 基线 + 微调均已交付**：`src/tools/`（三件工具 + 白名单注册表，连通性探针全绿）· `src/agent/tool_parser.py`（四门状态机 **20/20**）· `src/agent/react.py`（六重护栏 + trace）· `configs/agent.yaml` ｜ **零样本基线 59 条**：不给示例 37.3% vs 给示例 98.3%，且基座是「挑着调」（概念题 0/6）而非不会 ｜ **护栏已实证生效**（末步屏蔽：关→4/5 会调，开→0/5；`<tool_call>` 恰好是单 token 151657）｜ **空检索阈值实测标定 θ=0.55**（无关组 100% 判空、两组相关组 0% 误杀，间隔 +0.037 完全分离；⚠️「带雷达术语但无答案」的 0.5965 拦不住）｜ ⏳ 剩余：用 **tool5** 复跑端到端（引用溯源 + 护栏）· P6 阶段文档 `docs/12` 待建 | `scripts/p6_probe_zeroshot.py`、`scripts/p6_guard_probe.py`、`scripts/p6_eval_tools_full.py`、`reports/P6_零样本工具调用基线.md`、`reports/P6_护栏验证.md`、`reports/P6_ReAct端到端冒烟.md`、`reports/P6_带工具评测_{base,tool4,tool5}.md` |
 | **P8 部署与展示** | 阶段 8 | 10 | ✅ **已完成（2026-09-21）**：FastAPI + 单页界面（`src/serve/app.py` + `static/index.html`），启动 `python scripts/p8_serve.py` → <http://127.0.0.1:7860>｜ **能看到 Agent 的中间过程**（每一步调了什么工具、返回了什么、耗时多少）· 引用原文**可点开** · 内置 5 个示例 ｜ ⭐ **一键切换「完整系统 / 无工具对照」**，把 P7 的结论直接演示出来 ｜ 复用 `src.agent.react` 与 `src.tools`，**不在服务端另写推理逻辑** ｜ ⚠️ 踩坑：pydantic 模型必须定义在**模块级**（本文件有 `from __future__ import annotations`，定义在函数内 → FastAPI 一律 422 且日志不说原因） | `scripts/p8_serve.py`、`src/serve/app.py`、`src/serve/static/index.html` |
+| **P10 Linux C/C++ 部署链** | （新方向） | 11 | ✅ **阶段 A 全部完成（2026-10-06）**：merge → GGUF → Q4_K_M ✅；WSL2 CUDA 构建 llama.cpp ✅；ReAct 移植 ✅；200 题回归定稿（量化退化 −0.035 轻微）✅ ｜ ✅✅ **阶段 B 全部完成（2026-10-07，B0-B9 十连）**：自研零依赖 C++ 引擎——GGUF 加载（双实现逐字节）→ BPE 分词（100/100）→ CPU 前向（27 层对拍 HF）→ **端到端 440/440 token 对拍 llama.cpp（总 DoD）** → OpenMP/BLAS/Q4（差距分解）→ AVX2 融合 kernel（Q4 17.9 tok/s）→ **CUDA 后端 F16 62.5 tok/s（llama.cpp 的 103%）** → **B7 Q4-on-GPU：自研 Q4_K/Q6_K fused dequant-dot kernel + CUDA Graphs，119.4 vs llama.cpp 116.9 tok/s（102%），显存 3.9GB→1.6GB** → **B8 批量 prefill + continuous batching：多列 gemv + KV 槽位池 + GPU argmax + 调度器，prefill 567–616 tok/s（4.8–5.3×）、B=8 聚合 469.6 tok/s（3.96×），批量 8/8 + 连续批 16/16 逐 id 一致**；⭐ 总结见 `docs/27`、kernel 迭代史见 `docs/28` §6.3 / `docs/29` §7.3 → **B9 采样 + ReAct 对接闭环：host 采样器（temp/top_k/top_p/seed + ban list）、radar-serve 零依赖最小 HTTP（会话级 LCP 前缀复用，bitwise 对拍过）、ReAct 护栏探针全绿、22 题评测子集与 llama-server 基线 Δ=+0.0000（16/22 逐字一致）**；⭐ 总结见 `docs/27`、kernel 迭代史见 `docs/28` §6.3 / `docs/29` §7.3 ｜ ⏳ 后续候选：PagedAttention/prefix caching、dp4a/MMQ prefill、OpenAI 兼容层、视觉塔 ｜ B8 顺手修复 decode attention 的 d_scores 跨头竞争 latent bug ｜ ⚠️ vllm-env 失效暂缓修复 | `docs/19-30`、`cpp/`、`reports/P10_*` |
 
 > ⚠️ **执行序 ≠ 阶段编号**。2026-09-14 用户拍板把**微调前移、RAG 后置**：
 > 目的是让"无检索基线"（§5.10）更干净。阶段编号保持不变，避免已有文档引用失效。
@@ -79,6 +135,7 @@
 | **英文文献入库范围（D2）** | 知识库 38 篇 → **入库 35 篇**（501 页零失败），跳过 3 篇：扫描件 1 篇（145 字/页，正文是整页位图）+ 用户拍板的 2 篇大部头（DTIC 179 页≈47 min / Boyd ADMM 125 页≈33 min）。⚠️ 跳过后「ADMM 相关检索」无原文可引，加回只需删 `SKIP_BODY` 对应键 | 用户 2026-09-20 拍板；`scripts/p4_mineru_papers.py` |
 | **文献切分粒度（D4）** | **按 section 切**（title 块做硬边界，覆盖率 100% 远优于正则的 49%），摘要独立成 chunk，图/表额外出独立 chunk 挂 `parent_id`。摘要需兼容**两种形态**（paragraph `Abstract—` / title 块 `Abstract`）与**中英双语**（`摘要：`） | 用户 2026-09-19 拍板；`src/retrieval/paper_chunk.py` |
 | **教材 / 文献索引关系（D3）** | ⚠️ **2026-09-20 修订：统一入库，不再分开建库**。三源（book / mmwave / paper）进同一索引 `index/unified`，默认全库查询；分开能力改由 `sources.json` 提供（检索时按 `source_id` 前缀过滤），P4-S2 照样能做「教材-only vs 全库」A/B。<br>**修订依据**：bge-m3 跨语言实测 中文→英文 **0.556~0.595 且 4/4 排序正确**（`logs/probe/p4_bge_stdout.txt`）；⚠️ 但那是**理想句对**的实测，是**上界不是期望值**，故 A/B 仍必须做。原决策（分开）的风险此时已由 `sources` 过滤消除 | 用户 2026-09-19 拍板 → 2026-09-20 修订；`src/retrieval/index.py` |
+| **阶段 B「手写 vs 接库」边界** | **前向图/KV cache/采样手写（引擎本体）+ GEMM 走 OpenBLAS 主线、HTTP/JSON 接库（生产做法）**；分词器手写仅为学习验证（生产等价物 tokenizers-cpp） | 用户 2026-10-06 拍板；`docs/20` §5.2b |
 | 项目根 | `F:\Qwen3-2B\radar-agent\` | 本文件 |
 | 基座模型位置 | `F:\Qwen3-2B\dir\`（**不搬移**，config 用绝对路径引用） | §4.1 |
 
