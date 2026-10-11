@@ -121,33 +121,58 @@ int main(int argc, char** argv) {
             cudaEvent_t ea, eb;
             CU_CHECK(cudaEventCreate(&ea));
             CU_CHECK(cudaEventCreate(&eb));
-            float ms_fma = 0.0f, ms_dp4a = 0.0f;
 
-            probe_fma<<<blocks, threads>>>(csink, loops);
-            CU_CHECK(cudaDeviceSynchronize());
-            CU_CHECK(cudaEventRecord(ea));
-            probe_fma<<<blocks, threads>>>(csink, loops);
-            CU_CHECK(cudaEventRecord(eb));
-            CU_CHECK(cudaEventSynchronize(eb));
-            CU_CHECK(cudaEventElapsedTime(&ms_fma, ea, eb));
+            // ⚠️ Measurement methodology, fixed in B14 (docs/38 §7.11).
+            //
+            // This used to take a SINGLE timed launch of each probe after a single
+            // warm-up launch. The fma kernel runs ~2.5 ms, which on a laptop GPU with
+            // aggressive clock scaling is too short to reach a steady boosted clock,
+            // while the dp4a kernel runs ~3.3x longer and therefore averages a
+            // different (higher) clock. The quotient was consequently dominated by
+            // clock ramp rather than pipe throughput: five consecutive runs of the
+            // SAME binary gave 3.58x / 2.07x / 1.31x / 1.91x / 3.19x, with the dp4a
+            // rate steady (63-79 G warp-instr/s) and the fma rate swinging 76-196.
+            // test_b11.sh gated on that quotient, so the gate was a coin flip.
+            //
+            // Fix: interleave the two probes so they see the same clock trajectory,
+            // and take the BEST of REPS -- the least throttled sample, which is what
+            // a pipe-ceiling claim actually means. The spread is printed so a reader
+            // can see how much clock noise is in play.
+            const int REPS = 5;
+            float best_fma = 1e30f, best_dp4a = 1e30f, worst_fma = 0.0f, worst_dp4a = 0.0f;
+            for (int rep = 0; rep < REPS; ++rep) {
+                float ms = 0.0f;
+                probe_fma<<<blocks, threads>>>(csink, loops);   // warm, untimed
+                CU_CHECK(cudaDeviceSynchronize());
+                CU_CHECK(cudaEventRecord(ea));
+                probe_fma<<<blocks, threads>>>(csink, loops);
+                CU_CHECK(cudaEventRecord(eb));
+                CU_CHECK(cudaEventSynchronize(eb));
+                CU_CHECK(cudaEventElapsedTime(&ms, ea, eb));
+                if (ms < best_fma) best_fma = ms;
+                if (ms > worst_fma) worst_fma = ms;
 
-            probe_dp4a<<<blocks, threads>>>(csink, loops);
-            CU_CHECK(cudaDeviceSynchronize());
-            CU_CHECK(cudaEventRecord(ea));
-            probe_dp4a<<<blocks, threads>>>(csink, loops);
-            CU_CHECK(cudaEventRecord(eb));
-            CU_CHECK(cudaEventSynchronize(eb));
-            CU_CHECK(cudaEventElapsedTime(&ms_dp4a, ea, eb));
+                probe_dp4a<<<blocks, threads>>>(csink, loops);  // warm, untimed
+                CU_CHECK(cudaDeviceSynchronize());
+                CU_CHECK(cudaEventRecord(ea));
+                probe_dp4a<<<blocks, threads>>>(csink, loops);
+                CU_CHECK(cudaEventRecord(eb));
+                CU_CHECK(cudaEventSynchronize(eb));
+                CU_CHECK(cudaEventElapsedTime(&ms, ea, eb));
+                if (ms < best_dp4a) best_dp4a = ms;
+                if (ms > worst_dp4a) worst_dp4a = ms;
+            }
+            const float ms_fma = best_fma, ms_dp4a = best_dp4a;
 
             const double warp_instr = static_cast<double>(blocks) * (threads / 32) * loops * 8.0;
             const double fma_mac = warp_instr * 32.0 / (ms_fma * 1e-3);        // 1 MAC/lane
             const double dp4a_mac = warp_instr * 32.0 * 4.0 / (ms_dp4a * 1e-3);  // 4 MAC/lane
-            std::printf("%-34s %8.2f ms  %7.1f G warp-instr/s  %7.3f T MAC/s\n",
+            std::printf("%-34s %8.2f ms  %7.1f G warp-instr/s  %7.3f T MAC/s   (best of %d; spread %.2f-%.2f ms)\n",
                         "fma  (8 indep chains)", ms_fma, warp_instr / (ms_fma * 1e-3) / 1e9,
-                        fma_mac / 1e12);
-            std::printf("%-34s %8.2f ms  %7.1f G warp-instr/s  %7.3f T MAC/s\n",
+                        fma_mac / 1e12, REPS, best_fma, worst_fma);
+            std::printf("%-34s %8.2f ms  %7.1f G warp-instr/s  %7.3f T MAC/s   (best of %d; spread %.2f-%.2f ms)\n",
                         "dp4a (8 indep chains)", ms_dp4a, warp_instr / (ms_dp4a * 1e-3) / 1e9,
-                        dp4a_mac / 1e12);
+                        dp4a_mac / 1e12, REPS, best_dp4a, worst_dp4a);
             // Three different numbers, and the distinction is the whole point:
             //   * the PIPE ceiling is fixed by silicon: 64 INT32 lanes vs 128 FP32
             //     lanes per SM, times 4 int8 MACs per dp4a => exactly 2.00x. This is

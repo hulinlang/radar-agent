@@ -76,13 +76,25 @@ if [ -x "$BUILD/b11-roof" ]; then
   # MAC/SM/clk (64 INT32 lanes x 4 MAC/dp4a)". The number parsed here is a QUOTIENT
   # of two microbenchmarks, and its denominator (the measured fma rate) itself
   # undershoots the nominal 128 because the FFMA probe carries register-bank
-  # pressure. So the quotient legitimately reads 2.00-2.25x.
+  # pressure.
   #
   # ⚠️ History: this assertion used to be `<= 2.06`. It passed at 2.00x in one
-  # session and FAILED at 2.17x in another with ZERO code change (2026-10-11),
-  # because the b11-roof binary was not touched. A flaky gate is worse than no
-  # gate -- it teaches you to ignore failures. Assert only a sanity band that
-  # still catches a broken probe, and record the measured value as evidence.
+  # session and FAILED at 2.17x in another with ZERO code change (2026-10-11).
+  # It then failed hard at 1.20x during B14's post-flip suite -- again with no
+  # B14-related file touched (git verified). Root cause was in the PROBE, not the
+  # gate: b11_roof.cu took a SINGLE timed launch of each kernel, and the fma kernel
+  # (~2.5 ms) is too short on this laptop GPU to reach a boosted clock while the
+  # dp4a kernel (~8 ms) is not. Five consecutive runs of one binary gave
+  # 3.58/2.07/1.31/1.91/3.19x with the dp4a rate steady and the fma rate swinging
+  # 76-196 G warp-instr/s -- i.e. the quotient was measuring clock ramp.
+  #
+  # Fixed in b11_roof.cu (interleave the probes + best-of-5): the same quotient now
+  # reads 1.84-2.18x over six runs, and the absolute rates land on silicon
+  # (fma 219-226 vs 216 G warp-instr/s nominal; dp4a 101-123 vs 108). The band
+  # below is therefore meaningful again, and it keeps margin on both sides.
+  # Lesson (4th of its kind in B11-B14): when a gate is flaky, suspect the
+  # measurement before widening the band -- widening it twice would have made the
+  # gate decorative.
   if [ -n "$ratio" ] && awk "BEGIN{exit !($ratio >= 1.5 && $ratio <= 2.6)}"; then
     ok "dp4a achieved ${ratio}x of the MEASURED fma rate (nominal pipe ceiling 2.00x vs 128 FP32 MAC/SM/clk; the DoD needs more than 2x)"
   else
