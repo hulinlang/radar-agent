@@ -310,3 +310,32 @@ Q6_K 的提取成本是 Q4_K 的 **2.0×**（1.36 / 0.67），与 §5 风险 R1 
 即使只到 986，叠加 B14（attention 5.7 ms，届时是第一大项）也能过线。
 
 **⇒ 判据只能是步骤 6 的引擎内同会话配对测量**（§5 风险 R6）。
+
+### 7.2 ✅ 步骤 2：host 分片原型（2026-10-11）
+
+照 B12 验证过的做法（`docs/36` §7.6）：**先把 lane 映射在 CPU 上逐位验对，再写 CUDA**。
+
+新增 `cpp/src/int8_act.{h,cpp}`：
+
+| 产物 | 作用 |
+|---|---|
+| `mma16_a_map` / `mma16_b_map` / `mma16_c_map` | `m16n8k16`（8-bit）的 PTX 分片映射 |
+| `mma16_fragment_coverage_ok()` | 证明三张映射各是**双射**（16×16 / 16×8 / 16×8） |
+| `matvec_q6_k_q8_1_mma_host()` | 与 `matvec_q6_k_q8_1_host` **同数学**，但每个 A/B 元素**经分片映射取数** |
+| `q6k_value()` | Q6_K 的取值公式，与 `gpu_quants.cuh` 的 `q6k_at` 逐字一致 |
+
+**实测（2 个 Q6_K 张量，零编译警告）**：
+
+```
+mma16 fragment maps  A 16x16 / B 16x8 / C 16x8  BIJECTIVE
+host Q6_K int8 gemv via m16n8k16 FRAGMENTS  16 x 2048 x 1024  BIT-EXACT   (attn_v)
+                                            16 x 6144 x 2048  BIT-EXACT   (ffn_down, nb=24)
+```
+
+**买到了什么**：① `m16n8k16` 的 lane 映射**逐位证实正确**（映射写错会配错乘积，
+于是对不上布局无关的参考 —— 所以这条 bit-exact 同时验证了映射与 **16 值半块边界**、
+`qh` 的 4 种 2-bit 位置）；② CUDA kernel 写完后只要与这个原型逐位一致，
+映射就自动成立；③ `ffn_down` 的 `nb=24`（`in=6144`）顺带覆盖了长 k 循环。
+
+> **下一步（步骤 3/4）**：`gpu_q6k_int8.cu`，先 dp4a 再 `m16n8k16`，
+> 要求与 `matvec_q6_k_q8_1_mma_host` **逐位一致**。

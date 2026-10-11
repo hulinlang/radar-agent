@@ -77,4 +77,19 @@ void matvec_q4_k_q8_1_mma_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds*
 // tile exactly once. A cheap, numeric-independent check of the mapping itself.
 bool mma_fragment_coverage_ok();
 
+// ---------------------------------------------------------------- B13 step 2
+// The same treatment for Q6_K, but with `m16n8k16` -- and that is not a
+// compromise: Q6_K's scale granularity is 16 values (sc[nn*8 + l/16 + 2*qq]), so
+// K=16 is exactly one half-block, whereas Q4_K's is 32. The measured tensor-core
+// ceilings are identical (1023.7 vs 1023.8 MAC/SM/clk), so K=16 costs nothing.
+//
+// Same purpose as the Q4_K twin: fetch every A/B element THROUGH the fragment map
+// so a wrong lane mapping cannot hide (a layout-agnostic reference would still
+// produce an exact-but-wrong dot).
+void matvec_q6_k_q8_1_mma_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
+                               float* y, int in, int out, int ncol);
+
+// True iff the m16n8k16 A (16x16), B (16x8) and C (16x8) maps are each bijective.
+bool mma16_fragment_coverage_ok();
+
 }  // namespace ri

@@ -337,4 +337,153 @@ void matvec_q4_k_q8_1_mma_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds*
     }
 }
 
+// ---------------------------------------------------------------- B13 step 2
+// m16n8k16 int8: A is 16x16 (2 regs/thread), B is 16x8 (1 reg), C/D is 16x8
+// int32 (4 regs). Still lane = gid*4 + tig.
+namespace {
+
+inline void mma16_a_map(int lane, int reg, int b, int* row, int* k) {
+    const int gid = lane >> 2, tig = lane & 3;
+    *row = gid + (reg ? 8 : 0);
+    *k = tig * 4 + b;
+}
+
+inline void mma16_b_map(int lane, int b, int* k, int* col) {
+    const int gid = lane >> 2, tig = lane & 3;
+    *k = tig * 4 + b;
+    *col = gid;
+}
+
+inline void mma16_c_map(int lane, int reg, int* row, int* col) {
+    const int gid = lane >> 2, tig = lane & 3;
+    *row = gid + ((reg >= 2) ? 8 : 0);
+    *col = tig * 2 + (reg & 1);
+}
+
+// Q6_K value at (row, super-block b, nn, qq) with l in [0,32) -- the q6k_at
+// formula, kept identical to gpu_quants.cuh and to matvec_q6_k_q8_1_host.
+inline int q6k_value(const uint8_t* sb, int nn, int qq, int l) {
+    const uint8_t* ql = sb + nn * 64;
+    const uint8_t* qh = sb + 128 + nn * 32;
+    const uint8_t byte = ql[l + (qq & 1) * 32];
+    const int nib = (qq < 2) ? (byte & 0xF) : (byte >> 4);
+    return (nib | (((qh[l] >> (2 * qq)) & 3) << 4)) - 32;
+}
+
+}  // namespace
+
+bool mma16_fragment_coverage_ok() {
+    {   // A: 32 lanes x 2 regs x 4 bytes = 256 = 16 x 16
+        int seen[16][16] = {};
+        for (int lane = 0; lane < 32; ++lane)
+            for (int reg = 0; reg < 2; ++reg)
+                for (int b = 0; b < 4; ++b) {
+                    int r, k;
+                    mma16_a_map(lane, reg, b, &r, &k);
+                    if (r < 0 || r >= 16 || k < 0 || k >= 16) return false;
+                    if (++seen[r][k] != 1) return false;
+                }
+    }
+    {   // B: 32 x 1 x 4 = 128 = 16 x 8
+        int seen[16][8] = {};
+        for (int lane = 0; lane < 32; ++lane)
+            for (int b = 0; b < 4; ++b) {
+                int k, c;
+                mma16_b_map(lane, b, &k, &c);
+                if (k < 0 || k >= 16 || c < 0 || c >= 8) return false;
+                if (++seen[k][c] != 1) return false;
+            }
+    }
+    {   // C/D: 32 x 4 = 128 = 16 x 8
+        int seen[16][8] = {};
+        for (int lane = 0; lane < 32; ++lane)
+            for (int reg = 0; reg < 4; ++reg) {
+                int r, c;
+                mma16_c_map(lane, reg, &r, &c);
+                if (r < 0 || r >= 16 || c < 0 || c >= 8) return false;
+                if (++seen[r][c] != 1) return false;
+            }
+    }
+    return true;
+}
+
+void matvec_q6_k_q8_1_mma_host(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds,
+                               float* y, int in, int out, int ncol) {
+    const int nb = in / QK_K;
+    const size_t row_bytes = static_cast<size_t>(nb) * Q6K_BLOCK_BYTES;
+    for (int rt = 0; rt < out; rt += 16) {
+        const int nr = std::min(16, out - rt);
+        for (int ct = 0; ct < ncol; ct += 8) {
+            const int nc = std::min(8, ncol - ct);
+            std::vector<float> acc(static_cast<size_t>(nr) * nc, 0.0f);
+            for (int b = 0; b < nb; ++b) {
+                // sd is reset per super-block and consumed by `acc += d6 * sd`;
+                // the accumulation order (nn, qq, half) and the fp32
+                // parenthesisation below are the spec (matvec_q6_k_q8_1_host).
+                std::vector<float> sd(static_cast<size_t>(nr) * nc, 0.0f);
+                for (int nn = 0; nn < 2; ++nn) {
+                    for (int qq = 0; qq < 4; ++qq) {
+                        const int g = nn * 4 + qq;
+                        for (int half = 0; half < 2; ++half) {
+                            // ---- A tile (16 rows x 16 k), through the map ----
+                            // K=16 is exactly one half-block of Q6_K's scale.
+                            int8_t A[16][16];
+                            for (int lane = 0; lane < 32; ++lane)
+                                for (int reg = 0; reg < 2; ++reg)
+                                    for (int bb = 0; bb < 4; ++bb) {
+                                        int r, k;
+                                        mma16_a_map(lane, reg, bb, &r, &k);
+                                        const uint8_t* sb =
+                                            w + static_cast<size_t>(rt + r) * row_bytes +
+                                            static_cast<size_t>(b) * Q6K_BLOCK_BYTES;
+                                        A[r][k] = static_cast<int8_t>(
+                                            q6k_value(sb, nn, qq, half * 16 + k));
+                                    }
+                            // ---- B tile (16 k x 8 cols), through the map ----
+                            int8_t B[16][8];
+                            for (int lane = 0; lane < 32; ++lane)
+                                for (int bb = 0; bb < 4; ++bb) {
+                                    int k, c;
+                                    mma16_b_map(lane, bb, &k, &c);
+                                    if (ct + c < ncol)
+                                        B[k][c] = qs[q8_index(b * 8 + g, ct + c,
+                                                              half * 16 + k, ncol)];
+                                }
+                            // ---- exact int32 dot + the reference's epilogue ----
+                            for (int r = 0; r < nr; ++r) {
+                                const uint8_t* sb =
+                                    w + static_cast<size_t>(rt + r) * row_bytes +
+                                    static_cast<size_t>(b) * Q6K_BLOCK_BYTES;
+                                const int8_t* scp = reinterpret_cast<const int8_t*>(sb + 192) + nn * 8;
+                                const int32_t scg = static_cast<int32_t>(scp[half + 2 * qq]);
+                                for (int n = 0; n < nc; ++n) {
+                                    int32_t dot = 0;
+                                    for (int k = 0; k < 16; ++k) dot += A[r][k] * B[k][n];
+                                    const float d8 =
+                                        ds[static_cast<size_t>(b * 8 + g) * ncol + ct + n].d;
+                                    const size_t o = static_cast<size_t>(r) * nc + n;
+                                    sd[o] += d8 * static_cast<float>(dot * scg);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (int r = 0; r < nr; ++r) {
+                    const uint8_t* sb = w + static_cast<size_t>(rt + r) * row_bytes +
+                                        static_cast<size_t>(b) * Q6K_BLOCK_BYTES;
+                    const float d6 = f16_to_f32(load_f16_bits(sb + 208));
+                    for (int n = 0; n < nc; ++n) {
+                        const size_t o = static_cast<size_t>(r) * nc + n;
+                        acc[o] += d6 * sd[o];
+                    }
+                }
+            }
+            for (int r = 0; r < nr; ++r)
+                for (int n = 0; n < nc; ++n)
+                    y[static_cast<size_t>(ct + n) * out + rt + r] =
+                        acc[static_cast<size_t>(r) * nc + n];
+        }
+    }
+}
+
 }  // namespace ri

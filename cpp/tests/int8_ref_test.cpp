@@ -117,6 +117,12 @@ int main(int argc, char** argv) {
                     cov ? "BIJECTIVE" : "NOT A BIJECTION");
         if (!cov) ++fails;
     }
+    {
+        const bool cov = ri::mma16_fragment_coverage_ok();
+        std::printf("mma16 fragment maps  A 16x16 / B 16x8 / C 16x8  %s\n",
+                    cov ? "BIJECTIVE" : "NOT A BIJECTION");
+        if (!cov) ++fails;
+    }
     try {
         const Meta m = read_meta(argv[2]);
         if (m.in <= 0 || m.in % 256 != 0 || m.ncol <= 0 || m.nrow <= 0) {
@@ -266,6 +272,42 @@ int main(int argc, char** argv) {
                             m.ncol, m.in, m.out);
             } else {
                 std::printf("host Q4_K int8 gemv via MMA FRAGMENTS  MISMATCH %zu/%ld elems, "
+                            "first idx %zu, max|d|=%.6g (%.2e of y_scale) at col %zu row %zu\n",
+                            bad, static_cast<long>(m.nrow) * m.ncol, first, maxabs, worst,
+                            worst_c, worst_r);
+                ++fails;
+            }
+        }
+
+        // ---- 2c. B13 step 2: the same for Q6_K through m16n8k16 fragments.
+        //         K=16 is exactly Q6_K's scale granularity (one half-block).
+        if (m.type == 14) {
+            std::vector<float> gotm(static_cast<size_t>(m.ncol) * m.out);
+            ri::matvec_q6_k_q8_1_mma_host(raw, qsv.data(), dsv.data(), gotm.data(),
+                                          static_cast<int>(m.in), static_cast<int>(m.out),
+                                          static_cast<int>(m.ncol));
+            const float* ref = reinterpret_cast<const float*>(yb.data());
+            size_t first = 0, bad = 0;
+            double maxabs = 0.0, worst = 0.0;
+            size_t worst_c = 0, worst_r = 0;
+            for (long c = 0; c < m.ncol; ++c) {
+                for (long r = 0; r < m.nrow; ++r) {
+                    const float a = gotm[static_cast<size_t>(c) * m.out + r];
+                    const float b = ref[static_cast<size_t>(r) * m.ncol + c];
+                    if (std::memcmp(&a, &b, 4) != 0) {
+                        if (bad == 0) first = static_cast<size_t>(c) * m.out + r;
+                        ++bad;
+                        const double d = std::fabs(static_cast<double>(a) - b);
+                        if (d > maxabs) { maxabs = d; worst_c = c; worst_r = r; }
+                    }
+                }
+            }
+            worst = m.y_scale > 0 ? maxabs / m.y_scale : maxabs;
+            if (bad == 0) {
+                std::printf("host Q6_K int8 gemv via m16n8k16 FRAGMENTS  %ld x %ld x %ld  "
+                            "BIT-EXACT\n", m.ncol, m.in, m.out);
+            } else {
+                std::printf("host Q6_K int8 gemv via m16n8k16 FRAGMENTS  MISMATCH %zu/%ld elems, "
                             "first idx %zu, max|d|=%.6g (%.2e of y_scale) at col %zu row %zu\n",
                             bad, static_cast<long>(m.nrow) * m.ncol, first, maxabs, worst,
                             worst_c, worst_r);
