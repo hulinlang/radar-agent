@@ -104,6 +104,13 @@ if(CMAKE_CUDA_COMPILER)
   add_executable(b14-roof tests/b14_roof.cu)
   target_link_libraries(b14-roof PRIVATE CUDA::cudart)
   set_target_properties(b14-roof PROPERTIES CUDA_ARCHITECTURES "89")
+# B14：attention 的 A/B 试装台 —— 出厂 kernel（逐字复制）+ 每相位 clock64 占比，
+#   与 FA 原型（模板 <TQ,TC>）在同一会话、同一形状下对比，并对 host 双精度参考
+#   校验（含一个强制触发 online softmax 重标定的用例）。先在这里把 kernel 做对，
+#   再接进引擎 —— 免得在引擎里调注意力。
+  add_executable(b14-attn tests/b14_attn.cu)
+  target_link_libraries(b14-attn PRIVATE CUDA::cudart)
+  set_target_properties(b14-attn PROPERTIES CUDA_ARCHITECTURES "89")
 # B11：层①对拍的 CUDA 半边（同一份参考文件，逐元素 bit-exact）
   add_executable(int8-ref-test-cuda src/gguf.cpp src/int8_act.cpp tests/int8_ref_test.cpp)
   target_include_directories(int8-ref-test-cuda PRIVATE src)
