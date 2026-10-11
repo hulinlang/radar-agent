@@ -69,13 +69,30 @@ __device__ __forceinline__ uint32_t load_q6k_u32(const uint8_t* p) {
     return lo | (hi << 16);
 }
 
+// MEASUREMENT-ONLY ablation knob (docs/37 §7.4). RADAR_Q6K_ABLATE=1 drops the
+// packed sign conversion, =2 drops the whole A-fragment extraction *including its
+// loads*, feeding a constant instead. The results are numerically WRONG by design;
+// the point is to bound how much of the Q6_K time the extraction actually costs,
+// so that an alignment repack is not built on speculation. (B12's lesson: isolated
+// probes bound things from above, so measure the real kernel.)
+//
+// Read on the HOST and passed in: a function-scope static __device__ variable with
+// dynamic initialisation is a compile error, and a per-call getenv would be silly.
+int q6k_ablate_level() {
+    static const int lvl = [] {
+        const char* e = std::getenv("RADAR_Q6K_ABLATE");
+        return e ? std::atoi(e) : 0;
+    }();
+    return lvl;
+}
+
 // One warp owns a 16-row x (NTILE*8)-column tile. Grid:
 //   x = row tiles / WARPS,  y = column groups.
 template <int WARPS, int NTILE>
 __global__ void __launch_bounds__(WARPS * 32) gemv_q6k_mma_kernel(
     const uint8_t* __restrict__ w, const int8_t* __restrict__ qs,
     const Q8_1Ds* __restrict__ ds, float* __restrict__ y, int in, int out,
-    int ncol, int stride) {
+    int ncol, int stride, int ablate) {
     const int lane = threadIdx.x & 31;
     const int gid = lane >> 2;   // 0..7
     const int tig = lane & 3;    // 0..3
@@ -121,19 +138,31 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q6k_mma_kernel(
                     // ---- A fragment: 2 registers, K=16 = one half-block ----
                     // l = half*16 + k; ql index = nn*64 + (qq&1)*32 + l,
                     // qh index = 128 + nn*32 + l. 4 consecutive l = one u32 each.
-                    const int l0 = half * 16 + tig * 4;
-                    const uint32_t qlA = load_q6k_u32(sbA + nn * 64 + (qq & 1) * 32 + l0);
-                    const uint32_t qhA = load_q6k_u32(sbA + 128 + nn * 32 + l0);
-                    const uint32_t qlB = load_q6k_u32(sbB + nn * 64 + (qq & 1) * 32 + l0);
-                    const uint32_t qhB = load_q6k_u32(sbB + 128 + nn * 32 + l0);
-                    const uint32_t mA = 0x0F0F0F0Fu, m2 = 0x03030303u;
-                    // v = nib | (hi2 << 4), then the packed signed conversion.
-                    const uint32_t vA = ((qlA >> nib_shift) & mA) |
-                                        ((((qhA >> (2 * qq)) & m2)) << 4);
-                    const uint32_t vB = ((qlB >> nib_shift) & mA) |
-                                        ((((qhB >> (2 * qq)) & m2)) << 4);
-                    const uint32_t a0 = (vA + 0x60606060u) ^ 0x80808080u;
-                    const uint32_t a1 = (vB + 0x60606060u) ^ 0x80808080u;
+                    const int ab = ablate;
+                    uint32_t a0, a1;
+                    if (ab >= 2) {
+                        a0 = 0x01010101u;   // ablate: no loads, no extraction
+                        a1 = 0x01010101u;
+                    } else {
+                        const int l0 = half * 16 + tig * 4;
+                        const uint32_t qlA = load_q6k_u32(sbA + nn * 64 + (qq & 1) * 32 + l0);
+                        const uint32_t qhA = load_q6k_u32(sbA + 128 + nn * 32 + l0);
+                        const uint32_t qlB = load_q6k_u32(sbB + nn * 64 + (qq & 1) * 32 + l0);
+                        const uint32_t qhB = load_q6k_u32(sbB + 128 + nn * 32 + l0);
+                        const uint32_t mA = 0x0F0F0F0Fu, m2 = 0x03030303u;
+                        // v = nib | (hi2 << 4), then the packed signed conversion.
+                        const uint32_t vA = ((qlA >> nib_shift) & mA) |
+                                            ((((qhA >> (2 * qq)) & m2)) << 4);
+                        const uint32_t vB = ((qlB >> nib_shift) & mA) |
+                                            ((((qhB >> (2 * qq)) & m2)) << 4);
+                        if (ab == 1) {          // ablate: keep v (unsigned), skip the sign step
+                            a0 = vA;
+                            a1 = vB;
+                        } else {
+                            a0 = (vA + 0x60606060u) ^ 0x80808080u;
+                            a1 = (vB + 0x60606060u) ^ 0x80808080u;
+                        }
+                    }
 
                     // sc is int8 at sb+192, index nn*8 + half + 2*qq (per ROW).
                     const int sc_idx = nn * 8 + half + 2 * qq;
@@ -199,9 +228,10 @@ void gemv_q6k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y
     // The B-fragment load touches columns [cb0, cb0+7] of the LAST group, so the
     // activation buffer must be allocated to a whole number of column groups.
     if (stride < ((ncol + NTILE * 8 - 1) / (NTILE * 8)) * NTILE * 8) return;
+    const int ablate = q6k_ablate_level();
     const dim3 grid((out / 16 + 3) / 4, (ncol + NTILE * 8 - 1) / (NTILE * 8));
     gemv_q6k_mma_kernel<4, NTILE>
-        <<<grid, 4 * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+        <<<grid, 4 * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
 }
 
 }  // namespace gpuq
