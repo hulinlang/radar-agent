@@ -27,8 +27,10 @@ case "$branch" in
       'reports/P11_Roofline性能模型.md'
       'reports/p11_roofline.png'
       'reports/P7_端到端评测_p9radarinfer2.md'
-      'docs/2[0-9]_*'
-      'docs/3[0-6]_*'
+      'docs/[2-4][0-9]_*'   # B 里程碑区间（20-49）。
+                            # ⚠️ 2026-10-11 由 docs/2[0-9]_* + docs/3[0-6]_* 改成
+                            # 这个：新增 docs/37 时旧规则漏判，fence 当场报了一条
+                            # VIOLATION —— 这正是它该做的事（路由专属清单会过时）。
     ) ;;
   route/vllm)
     allow=(
