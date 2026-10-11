@@ -358,10 +358,62 @@ int main(int argc, char** argv) {
                 ++fails;
             }
         }
-        // 3b. the gemv. Only Q4_K has a CUDA int8 kernel: docs/34 section 6 keeps
-        //     Q6_K on the fp32 route until D3 says whether it is needed.
+        // 3b. the gemv. B11 only had a Q4_K CUDA int8 kernel; B13 added the Q6_K
+        //     one (m16n8k16), so both types are now covered by the same criterion:
+        //     bit-exact against the reference payload.
         if (m.type != 12) {
-            std::printf("cuda Q6_K int8 gemv  SKIPPED (still on the fp32 route)\n");
+            uint8_t* dw = nullptr;
+            int8_t* dqs = nullptr;
+            ri::Q8_1Ds* dds = nullptr;
+            float* dy = nullptr;
+            auto ck = [](cudaError_t e, const char* what) {
+                if (e != cudaSuccess) {
+                    throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+                }
+            };
+            ck(cudaMalloc(&dw, t->n_bytes), "cudaMalloc w");
+            ck(cudaMalloc(&dqs, qs_bytes), "cudaMalloc qs");
+            ck(cudaMalloc(&dds, ds_bytes), "cudaMalloc ds");
+            ck(cudaMalloc(&dy, got.size() * sizeof(float)), "cudaMalloc y");
+            ck(cudaMemcpy(dw, raw, t->n_bytes, cudaMemcpyHostToDevice), "memcpy w");
+            ck(cudaMemcpy(dqs, qsv.data(), qs_bytes, cudaMemcpyHostToDevice), "memcpy qs");
+            ck(cudaMemcpy(dds, dsv.data(), ds_bytes, cudaMemcpyHostToDevice), "memcpy ds");
+            ck(cudaMemset(dy, 0, got.size() * sizeof(float)), "memset y");
+            ri::gpuq::gemv_q6k_mma(reinterpret_cast<const uint8_t*>(dw), dqs, dds, dy,
+                                   static_cast<int>(m.in), static_cast<int>(m.out),
+                                   static_cast<int>(m.ncol), static_cast<int>(m.ncol));
+            ck(cudaDeviceSynchronize(), "sync q6k mma");
+            std::vector<float> cq(got.size());
+            ck(cudaMemcpy(cq.data(), dy, cq.size() * sizeof(float), cudaMemcpyDeviceToHost),
+               "memcpy y back");
+            cudaFree(dw); cudaFree(dqs); cudaFree(dds); cudaFree(dy);
+
+            const float* refq = reinterpret_cast<const float*>(yb.data());
+            size_t bad = 0, first = 0;
+            double maxabs = 0.0;
+            size_t wc = 0, wr = 0;
+            for (long c = 0; c < m.ncol; ++c) {
+                for (long r = 0; r < m.nrow; ++r) {
+                    const float a = cq[static_cast<size_t>(c) * m.out + r];
+                    const float b = refq[static_cast<size_t>(r) * m.ncol + c];
+                    if (std::memcmp(&a, &b, 4) != 0) {
+                        if (bad == 0) first = static_cast<size_t>(c) * m.out + r;
+                        ++bad;
+                        const double d = std::fabs(static_cast<double>(a) - b);
+                        if (d > maxabs) { maxabs = d; wc = c; wr = r; }
+                    }
+                }
+            }
+            if (bad == 0) {
+                std::printf("cuda Q6_K int8 m16n8k16 gemv  %ld x %ld x %ld  BIT-EXACT\n",
+                            m.ncol, m.in, m.out);
+            } else {
+                std::printf("cuda Q6_K int8 m16n8k16 gemv  MISMATCH %zu/%ld elems, first idx %zu, "
+                            "max|d|=%.6g (%.2e of y_scale) at col %zu row %zu\n",
+                            bad, static_cast<long>(m.nrow) * m.ncol, first, maxabs,
+                            m.y_scale > 0 ? maxabs / m.y_scale : maxabs, wc, wr);
+                ++fails;
+            }
         } else {
             uint8_t* dw = nullptr;
             int8_t* dqs = nullptr;

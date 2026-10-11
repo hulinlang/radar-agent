@@ -98,5 +98,23 @@ void gemv_q4k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y
                   int in, int out, int ncol, int stride,
                   cudaStream_t stream = nullptr);
 
+// ---------------- B13: the same treatment for Q6_K (m16n8k16) ----------------
+//
+// Q6_K's scale granularity is 16 values, so this uses `m16n8k16` (K=16 = exactly
+// one half-block); the measured tensor-core ceilings are identical to K=32's
+// (1023.7 vs 1023.8 MAC/SM/clk), so the smaller K costs nothing. Bit-exact with
+// ri::matvec_q6_k_q8_1_host.
+//
+// ⭐ The A operand is built SIGNED (q6 in [-32,31]), which removes the offset term
+//   `-32*sum(q8)` and with it the need for a half-block sum of q8 -- which
+//   Q8_1Ds does not store. docs/37 §3.3 flagged that as the project's one real
+//   design decision; this makes it moot. `int8(v-32) == (v + 0x60) ^ 0x80`,
+//   byte-wise, no carry (valid because v <= 63).
+//
+// Same `stride` contract as gemv_q4k_mma.
+void gemv_q6k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                  int in, int out, int ncol, int stride,
+                  cudaStream_t stream = nullptr);
+
 }  // namespace gpuq
 }  // namespace ri

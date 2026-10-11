@@ -38,6 +38,15 @@ namespace {
 
 [[noreturn]] void fail(const std::string& msg) { throw std::runtime_error("gpu_model: " + msg); }
 
+// Environment flag with "off" expressible: present and not "0". A bare
+// getenv-presence test cannot be turned off from the outside, which is how an A/B
+// script ended up comparing MMA against MMA (see the RADAR_Q4_MMA site).
+bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return false;
+    return !(v[0] == '0' && v[1] == '\0');
+}
+
 int kv_u32(const GGUFFile& f, const std::string& key) {
     const Value* v = f.kv(key);
     if (!v) fail("missing metadata " + key);
@@ -723,6 +732,10 @@ struct GpuModel::Impl {
     // m16n8k32 tensor-core instruction. Off by default so the B11 record stays
     // reproducible; it is bit-exact with the dp4a route either way.
     bool mma = false;
+    // B13: RADAR_Q6K_INT8=1 also puts Q6_K on the int8 route (m16n8k16). Off by
+    // default: B11/B12 kept Q6_K on the fp32 route, and this changes end-to-end
+    // ids (it is a numerical change, not just an instruction swap).
+    bool q6k_int8 = false;
     int* d_tokens = nullptr;
     // B8b slot pool + batch decode state
     int max_batch = 1;
@@ -822,22 +835,36 @@ struct GpuModel::Impl {
 
     // B11: prefill-chunk dispatch. int8 activations are used only here (the
     // batch-decode path above keeps calling gemv_mc) and only for quantized
-    // weights -- F16 and Q6_K stay on the fp32 route for now, so the F16 440/440
-    // record and the whole decode record are untouched (docs/34 §3.1, §6).
+    // weights -- F16 stays on the fp32 route, so the F16 440/440 record and the
+    // whole decode record are untouched (docs/34 §3.1, §6).
+    // B13 adds Q6_K to this route (RADAR_Q6K_INT8=1, default off), because B12
+    // measured that the 30% of parameters still on the fp32 route were about half
+    // the gemv time (docs/36 §7.8).
     void gemv_prefill(const DevWeight& w, const float* x, float* y, int in, int out, int ncol) {
-        if (int8_act && w.type == 12 && in <= q8_k) {
+        const bool int8_ok = int8_act && in <= q8_k &&
+                             (w.type == 12 || (w.type == 14 && q6k_int8));
+        if (int8_ok) {
             gpuq::quantize_q8_1(x, d_q8s, d_q8ds, in, MAX_MC, stream);
-            // B12: tensor-core route. Both branches consume the same Q8_1 buffers
-            // and are bit-exact with each other, so the switch only moves the
-            // inner loop (docs/36 §7.7). `stride = MAX_MC` because the activation
-            // layout always carries MAX_MC columns; gemv_q4k_mma checks that the
-            // stride covers the last column group and no-ops otherwise.
-            if (mma && out % 16 == 0) {
-                gpuq::gemv_q4k_mma(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
-                                   out, ncol, MAX_MC, stream);
+            if (w.type == 12) {
+                // B12: tensor-core route. Both branches consume the same Q8_1
+                // buffers and are bit-exact with each other, so the switch only
+                // moves the inner loop (docs/36 §7.7). `stride = MAX_MC` because
+                // the activation layout always carries MAX_MC columns;
+                // gemv_q4k_mma checks that the stride covers the last column
+                // group and no-ops otherwise.
+                if (mma && out % 16 == 0) {
+                    gpuq::gemv_q4k_mma(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
+                                       out, ncol, MAX_MC, stream);
+                } else {
+                    gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y,
+                                             in, out, ncol, tile_rw, tile_nc, stream);
+                }
             } else {
-                gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
-                                         out, ncol, tile_rw, tile_nc, stream);
+                // B13: Q6_K has only the m16n8k16 variant -- K=16 is exactly its
+                // scale granularity (docs/37 §7.1). The dp4a intermediate step
+                // was skipped as low-value (docs/37 §7.3).
+                gpuq::gemv_q6k_mma(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
+                                   out, ncol, MAX_MC, stream);
             }
         } else {
             gemv_mc(w, x, y, in, out, ncol);
@@ -1381,7 +1408,11 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     // B12: RADAR_Q4_MMA=1 -> tensor-core inner loop. Bit-exact with the dp4a
     // route (int8-ref-test proves both against the NumPy reference), so this is
     // purely a throughput switch and can be A/B'd inside one session.
-    m->mma = std::getenv("RADAR_Q4_MMA") != nullptr;
+    //
+    // ⚠️ Uses env_on, not getenv-presence: a presence test makes `RADAR_Q4_MMA=0`
+    // mean ON, which silently made an A/B script compare MMA against MMA and
+    // produced a wrong "dp4a and MMA are equal" conclusion (2026-10-11).
+    m->mma = env_on("RADAR_Q4_MMA");
     std::fprintf(stderr, "[b11] int8 activations %s (prefill, quantized weights only; tile %dx%d)\n",
                  m->int8_act ? "ON" : "OFF (RADAR_Q4_FP32_ACT)", m->tile_rw, m->tile_nc);
     if (m->int8_act) {
@@ -1389,6 +1420,14 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
                      m->mma ? "int8 MMA (m16n8k32, tensor cores; RADAR_Q4_MMA)"
                             : "dp4a (B11 default; set RADAR_Q4_MMA=1 for the MMA route)");
     }
+    // B13: Q6_K on the int8 route. Default OFF -- this one DOES change end-to-end
+    // ids (int8 activation quantisation loses precision), unlike B12's pure
+    // instruction swap, so it is a Tier-B change (docs/37 §1.1).
+    m->q6k_int8 = env_on("RADAR_Q6K_INT8");
+    std::fprintf(stderr, "[b13] Q6_K prefill: %s\n",
+                 (m->int8_act && m->q6k_int8)
+                     ? "int8 m16n8k16 (tensor cores; RADAR_Q6K_INT8)"
+                     : "fp32 (B11/B12 default; set RADAR_Q6K_INT8=1 to move it)");
     CU_CHECK(cudaDeviceSynchronize());
     m->prof_init();
     // CUDA graph replay per decode token (RADAR_NO_CUDA_GRAPH=1 to force eager;
