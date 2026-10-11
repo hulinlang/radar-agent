@@ -242,10 +242,20 @@ B11 的 d_q8s/d_q8ds（已是 int8）──load──> B 分片 ─────�
 1. ✅ **roof 先量**（照 B11 的老办法）：`cpp/tests/b12_roof.cu`（+ CMake target `b12-roof`）。
    量了三件事：纯 MMA 天花板、解包系数 `c`、以及解包+MMA 在不同复用因子下的合并吞吐。
    **结果见 §7.1，并据此修正了 §2.2b 与 §3.5 的参数。**
-2. **扩展独立 NumPy 参考**：`cpp/tests/ref_q4_mma.py`，逐个 sub-block 用
-   `int32` 矩阵乘复现 §3.2，产出 golden payload（复用 B11 的 6 个张量）
-3. **host 侧语义原型**：在 CPU 上实现完整 MMA 语义（含分片映射与解包），
-   与 NumPy 参考 bit-exact —— **在写 CUDA 之前把语义钉死**
+2. ✅ **数学 oracle 复用，不新建 `ref_q4_mma.py`**（2026-10-11 核实后简化）。
+   B11 的 `cpp/tests/ref_q4_int8.py` **已经就是 MMA 的数学 oracle**：
+   - `ref_q4_int8.py:249`：`dot1` 是**精确 int32** 求和（源码注释原话：
+     *"dot1 is an exact int32 sum -> integer addition order is irrelevant"*）——
+     与 MMA 的 int32 累加**是同一个东西**；
+   - `sum_q` 是精确整数（§3.2 条件 2）；
+   - fp32 尾声的括号化与顺序已按 §3.2 条件 3 实现。
+
+   ⇒ 新建一份"MMA 参考"只会算出**同样的数字**，属于重复。B12 新增的不是数学，
+   而是**物理布局**（哪条 lane 拿哪个元素）与**解包**。
+3. **host 侧语义原型**：在 CPU 上实现**分片映射 + 解包**，与 B11 参考 bit-exact。
+   ⚠️ 关键：B11 参考是**逻辑索引、布局无关**的，所以它**抓不到 lane 映射写错**
+   （映射错了照样是一个"精确但错误"的 dot）。因此原型必须**按物理布局取数**再算，
+   这才是能抓映射错误的层①。**在写 CUDA 之前把语义钉死。**
 4. **CUDA kernel**：`gpu_mma.cu`，先在固定 tile 下与 host 原型 bit-exact
 5. **chunk 放大**（§3.5 选项 A）：`MAX_MC` 16 → 64，逐项核对 §2.2(c)
 6. **接入引擎**：`gemv_prefill` 分派；先 Q4_K，Q6_K 不动
