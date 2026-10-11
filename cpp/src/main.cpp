@@ -324,6 +324,12 @@ int main(int argc, char** argv) {
                 }
             }
             const auto t1 = Clock::now();
+            // B11/D4: the CPU path above already had RADAR_DEBUG_TOPK; the CUDA
+            // path did not, so the *numerical cost* of a route change could not
+            // be measured on GPU at all. Two lines, no numerics touched: they
+            // make "how far did the int8 route move the logits, relative to the
+            // top1-top2 margin" a number instead of a yes/no.
+            debug_topk(logits, static_cast<int>(ids.size()) - 1);
 
             if (!teacher_path.empty()) {
                 const std::vector<int32_t> teacher = read_id_list(teacher_path);
@@ -343,6 +349,7 @@ int main(int argc, char** argv) {
             while (static_cast<int>(gen.size()) < n_predict && next != tok.eos()) {
                 gen.push_back(next);
                 gpu.forward_logits(next, pos++, logits.data());
+                debug_topk(logits, pos - 1);   // logits that chose gen.back()
                 next = ri::sample_from(sampler, bans, logits.data(), logits.size(), scratch);
             }
             const auto t2 = Clock::now();

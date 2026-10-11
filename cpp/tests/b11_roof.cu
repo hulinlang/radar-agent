@@ -148,18 +148,28 @@ int main(int argc, char** argv) {
             std::printf("%-34s %8.2f ms  %7.1f G warp-instr/s  %7.3f T MAC/s\n",
                         "dp4a (8 indep chains)", ms_dp4a, warp_instr / (ms_dp4a * 1e-3) / 1e9,
                         dp4a_mac / 1e12);
-            // Two different numbers, and the distinction is the whole point:
+            // Three different numbers, and the distinction is the whole point:
             //   * the PIPE ceiling is fixed by silicon: 64 INT32 lanes vs 128 FP32
-            //     lanes per SM, times 4 int8 MACs per dp4a => exactly 2.00x,
-            //   * the ACHIEVED ratio is what a given instruction mix gets out of
-            //     those pipes (measured 1.5-2.0x here; it moves with clocks and
-            //     scheduling).
+            //     lanes per SM, times 4 int8 MACs per dp4a => exactly 2.00x. This is
+            //     defined against the NOMINAL 128 FP32 MAC/SM/clk.
+            //   * the MEASURED fma rate undershoots that nominal (this probe's FFMA
+            //     mix carries register-bank pressure and loop overhead: 104-114 of
+            //     128 MAC/SM/clk depending on the session).
+            //   * the ACHIEVED ratio below divides dp4a by the MEASURED fma, NOT by
+            //     the nominal 128. So it can legitimately read slightly ABOVE 2.00x
+            //     (observed 2.00x and 2.17x in two sessions with identical code).
+            //     Never gate an acceptance check on this quotient -- the hardware
+            //     claim is the 2.00x pipe ceiling, and that is measured absolutely.
             // The >=1000 tok/s DoD needs 2.85x, which is above the pipe ceiling --
             // that is why no dp4a tuning can reach it.
             std::printf("%-34s achieved dp4a/fma MAC ratio = %.2fx\n", "implication",
                         dp4a_mac / fma_mac);
-            std::printf("%-34s pipe ceiling = 2.00x (64 INT32 vs 128 FP32 lanes/SM, 4 MAC/dp4a);"
-                        " the >=1000 tok/s DoD needs more than 2x (docs/34 7.1)\n", "");
+            std::printf("%-34s   (denominator = MEASURED fma, which undershoots the nominal"
+                        " 128 MAC/SM/clk;\n", "");
+            std::printf("%-34s    hence this quotient may exceed 2.00x without violating silicon)\n", "");
+            std::printf("%-34s pipe ceiling = 2.00x vs the NOMINAL 128 FP32 MAC/SM/clk"
+                        " (64 INT32 lanes x 4 MAC/dp4a);\n", "");
+            std::printf("%-34s   the >=1000 tok/s DoD needs more than 2x (docs/34 7.1)\n", "");
             CU_CHECK(cudaEventDestroy(ea));
             CU_CHECK(cudaEventDestroy(eb));
             CU_CHECK(cudaFree(csink));
