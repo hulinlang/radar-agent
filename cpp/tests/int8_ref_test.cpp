@@ -342,6 +342,48 @@ int main(int argc, char** argv) {
             std::vector<float> cg(got.size());
             ck(cudaMemcpy(cg.data(), dy, cg.size() * sizeof(float), cudaMemcpyDeviceToHost),
                "memcpy y back");
+
+            // ---- B12: the SAME gemv through int8 MMA (tensor cores) ----
+            // Reuses the uploaded weights/activations; only a second y buffer.
+            if (m.type == 12) {
+                float* dy2 = nullptr;
+                ck(cudaMalloc(&dy2, got.size() * sizeof(float)), "cudaMalloc y2");
+                ck(cudaMemset(dy2, 0, got.size() * sizeof(float)), "memset y2");
+                ri::gpuq::gemv_q4k_mma(reinterpret_cast<const uint8_t*>(dw), dqs, dds, dy2,
+                                       static_cast<int>(m.in), static_cast<int>(m.out),
+                                       static_cast<int>(m.ncol), static_cast<int>(m.ncol));
+                ck(cudaDeviceSynchronize(), "sync mma");
+                std::vector<float> cm(got.size());
+                ck(cudaMemcpy(cm.data(), dy2, cm.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "memcpy y2 back");
+                cudaFree(dy2);
+                const float* refm = reinterpret_cast<const float*>(yb.data());
+                size_t badm = 0, firstm = 0;
+                double maxabsm = 0.0;
+                size_t wcm = 0, wrm = 0;
+                for (long c = 0; c < m.ncol; ++c) {
+                    for (long r = 0; r < m.nrow; ++r) {
+                        const float a = cm[static_cast<size_t>(c) * m.out + r];
+                        const float b = refm[static_cast<size_t>(r) * m.ncol + c];
+                        if (std::memcmp(&a, &b, 4) != 0) {
+                            if (badm == 0) firstm = static_cast<size_t>(c) * m.out + r;
+                            ++badm;
+                            const double d = std::fabs(static_cast<double>(a) - b);
+                            if (d > maxabsm) { maxabsm = d; wcm = c; wrm = r; }
+                        }
+                    }
+                }
+                if (badm == 0) {
+                    std::printf("cuda Q4_K int8 MMA gemv  %ld x %ld x %ld  BIT-EXACT\n",
+                                m.ncol, m.in, m.out);
+                } else {
+                    std::printf("cuda Q4_K int8 MMA gemv  MISMATCH %zu/%ld elems, first idx %zu, "
+                                "max|d|=%.6g (%.2e of y_scale) at col %zu row %zu\n",
+                                badm, static_cast<long>(m.nrow) * m.ncol, firstm, maxabsm,
+                                m.y_scale > 0 ? maxabsm / m.y_scale : maxabsm, wcm, wrm);
+                    ++fails;
+                }
+            }
             cudaFree(dw);
             cudaFree(dqs);
             cudaFree(dds);

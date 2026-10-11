@@ -136,6 +136,70 @@ __global__ void probe_mma_unpack(int8_t* dummy, long long* out, int iters) {
     if (lane == 0) out[blockIdx.x] = t1 - t0;
 }
 
+// ------------------------------------------- 3b. REALISTIC Q4_K extraction
+// The probe above models a GENERAL nibble unpack (4 nibbles packed in one 16-bit
+// word -> 4 bytes), which costs ~1.77 ops/value. That is NOT the Q4_K layout.
+// In Q4_K a sub-block's 32 values are 32 CONSECUTIVE BYTES all at the same nibble
+// position (see gpu_quants.cuh q4k_at), so 4 consecutive k values are the low (or
+// high) nibble of 4 consecutive bytes: `p & 0x0F0F0F0F` or `(p>>4) & 0x0F0F0F0F`.
+// 1-2 ops per 4 values, i.e. ~0.375 ops/value -- ~4.7x cheaper.
+__device__ __forceinline__ uint32_t q4k_lo4(uint32_t p) { return p & 0x0F0F0F0Fu; }
+__device__ __forceinline__ uint32_t q4k_hi4(uint32_t p) { return (p >> 4) & 0x0F0F0F0Fu; }
+
+__global__ void probe_q4k_extract(uint32_t* dummy, long long* out, int iters) {
+    uint32_t w[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) w[i] = 0x01234567u * (uint32_t)(i + 1) + threadIdx.x;
+    uint32_t acc[4] = {0, 0, 0, 0};
+    long long t0 = clock64();
+    for (int it = 0; it < iters; it++) {
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            w[i] ^= (uint32_t)(it + i);
+            acc[i & 3] ^= ((i & 1) ? q4k_hi4(w[i]) : q4k_lo4(w[i]));
+        }
+    }
+    long long t1 = clock64();
+    uint32_t s = acc[0] ^ acc[1] ^ acc[2] ^ acc[3];
+    if (s == 0xDEADBEEFu) dummy[0] = 1;
+    if ((threadIdx.x & 31) == 0) out[blockIdx.x] = t1 - t0;
+}
+
+template <int R>
+__global__ void probe_mma_q4k(int8_t* dummy, long long* out, int iters) {
+    const int lane = threadIdx.x & 31;
+    uint32_t w[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) w[i] = 0x01234567u * (uint32_t)(i + 1) + lane;
+    uint32_t b0 = 0x01010101u * (uint32_t)(lane + 5);
+    uint32_t b1 = 0x01010101u * (uint32_t)(lane + 6);
+    int32_t c[R][4];
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int i = 0; i < 4; i++) c[r][i] = 0;
+    long long t0 = clock64();
+    for (int it = 0; it < iters; it++) {
+        #pragma unroll
+        for (int i = 0; i < 4; i++) w[i] ^= (uint32_t)(it + i);
+        // two sub-blocks' worth: even sub-block = lo nibbles, odd = hi nibbles
+        const uint32_t a0 = q4k_lo4(w[0]);
+        const uint32_t a1 = q4k_hi4(w[1]);
+        const uint32_t a2 = q4k_lo4(w[2]);
+        const uint32_t a3 = q4k_hi4(w[3]);
+        #pragma unroll
+        for (int r = 0; r < R; r++) mma_m16n8k32(c[r], a0, a1, a2, a3, b0, b1);
+    }
+    long long t1 = clock64();
+    int32_t s = 0;
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int i = 0; i < 4; i++) s += c[r][i];
+    if (s == 123456789) dummy[0] = 1;
+    if (lane == 0) out[blockIdx.x] = t1 - t0;
+}
+
 static long long max_of(const long long* h, int n) {
     long long m = 0;
     for (int i = 0; i < n; i++) if (h[i] > m) m = h[i];
@@ -215,5 +279,48 @@ int main(int argc, char** argv) {
     std::printf("\n   model check: overhead should track 16c/T = %0.1f/T\n", 16.0 * c_coef);
     std::printf("   reading: if R=2 (T=16, today's chunk) shows ~100%%+ overhead, the\n");
     std::printf("   chunk MUST grow before the MMA is worth writing (docs/36 2.2b).\n");
+
+    // ---------- pass 4: the REALISTIC Q4_K extraction (see 3b above) ----------
+    double c_q4 = 1e30;
+    for (int p = 0; p < 3; p++) {
+        probe_q4k_extract<<<blocks, threads>>>(du, dT, iters); ck(cudaDeviceSynchronize(), "q4");
+        probe_q4k_extract<<<blocks, threads>>>(du, dT, iters); ck(cudaDeviceSynchronize(), "q4b");
+        ck(cudaMemcpy(hT, dT, sizeof(long long) * blocks, cudaMemcpyDeviceToHost), "c4");
+        c_q4 = fmin(c_q4, (double)max_of(hT, blocks));
+    }
+    const double V_q4 = vals_unp / c_q4;
+    const double c_q4k = 64.0 / V_q4;
+
+    std::printf("\nD) realistic Q4_K extraction (same nibble of 4 consecutive bytes)\n");
+    std::printf("   extraction only                    %8.1f values/SM/clk\n", V_q4);
+    std::printf("   => cost c                          %8.2f ops/value  (was %.2f for the\n",
+                c_q4k, c_coef);
+    std::printf("                                          GENERAL nibble unpack)\n");
+    std::printf("   => required T >= 16c               %8.1f tokens (<=100%% overhead)\n", 16.0 * c_q4k);
+    std::printf("   => required T for <=20%% overhead   %8.1f tokens\n", 80.0 * c_q4k);
+
+    std::printf("\nE) MMA reusing a realistically-extracted Q4_K A tile\n");
+    std::printf("   %-6s %-8s %14s %14s %10s\n", "R", "T=8R", "MAC/SM/clk", "vs ceiling", "overhead");
+    #define RUN_Q(RV) do {                                                       \
+        double best = 1e30;                                                      \
+        for (int p = 0; p < 3; p++) {                                            \
+            probe_mma_q4k<RV><<<blocks, threads>>>(dc, dT, iters);               \
+            ck(cudaDeviceSynchronize(), "mq");                                   \
+            probe_mma_q4k<RV><<<blocks, threads>>>(dc, dT, iters);               \
+            ck(cudaDeviceSynchronize(), "mq2");                                  \
+            ck(cudaMemcpy(hT, dT, sizeof(long long) * blocks,                    \
+                          cudaMemcpyDeviceToHost), "c5");                        \
+            best = fmin(best, (double)max_of(hT, blocks));                       \
+        }                                                                        \
+        const double macs = (double)warps * iters * (RV) * 4096;                 \
+        const double got = macs / best;                                          \
+        std::printf("   %-6d %-8d %14.1f %13.1f%% %9.0f%%\n", (RV), 8 * (RV),   \
+                    got, 100.0 * got / R_mma, 100.0 * (R_mma / got - 1.0));      \
+    } while (0)
+    RUN_Q(1); RUN_Q(2); RUN_Q(4); RUN_Q(8);
+    #undef RUN_Q
+
+    std::printf("\n   => with the real layout, W=16 (R=2) should no longer be the\n");
+    std::printf("      bottleneck; the remaining limit is weight re-read traffic.\n");
     return 0;
 }

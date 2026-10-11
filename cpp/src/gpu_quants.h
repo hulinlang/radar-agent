@@ -79,5 +79,24 @@ void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, fl
                         int in, int out, int ncol, int rw, int nc,
                         cudaStream_t stream = nullptr);
 
+// ---------------- B12: int8 MMA (tensor core), prefill only ----------------
+//
+// Same inputs and same output as gemv_q4k_q8_1, but the inner loop is
+// mma.sync.aligned.m16n8k32 instead of __dp4a. One MMA's K=32 is exactly one
+// Q4_K sub-block, so it is bit-exact with ri::matvec_q4_k_q8_1_host (verified in
+// int8-ref-test) and with the dp4a route.
+//
+// N is a RUNTIME parameter on purpose (docs/36 7.5): how many tokens share one
+// weight load is the only real lever on weight traffic, and the same kernel
+// should serve the current 16-wide chunk through a full-prompt width.
+//
+// `stride` is the allocated column count of the activation buffers (B11 always
+// passes 16); the B-fragment load touches a whole column group, so stride must
+// cover ceil(ncol / 16) * 16 columns. `out` must be a multiple of 16 and `in` a
+// multiple of 256 -- checked, and a no-op (leaving y alone) otherwise.
+void gemv_q4k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
+                  int in, int out, int ncol, int stride,
+                  cudaStream_t stream = nullptr);
+
 }  // namespace gpuq
 }  // namespace ri
