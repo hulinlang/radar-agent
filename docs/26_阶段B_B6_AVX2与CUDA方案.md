@@ -1,0 +1,160 @@
+# 阶段 B · B6 详细方案：AVX2 融合 kernel + CUDA 后端
+
+> 前置：B5 差距分解（docs/25 §8）：与 llama.cpp CPU Q4 差 11.6×，全部归因于
+> SIMD 融合 kernel / Q8_K 激活 / cache 阻塞；GPU 方向用户已拍板（"后续做 GPU 加速"），
+> 对比时**位数对齐**（F16 对 F16、Q4 对 Q4）。
+> B6 两个独立工作项：**B6a = AVX2 融合 dequant-dot（CPU 主线补完）**、
+> **B6b = CUDA 后端（前向图编排手写 + GEMM 走 cuBLAS，边界决策的 GPU 落点）**。
+
+---
+
+## B6a AVX2 融合 dequant-dot
+
+### 设计
+
+- **数学口径不变**：仍是"精确 dequant + F32 激活"（自研特色，teacher 实验已证明比
+  llama.cpp 的 Q8_K 激活更忠实 F16）。只把"dequant 到 F32 缓冲再点积"融合为
+  **寄存器内 dequant + FMA 累加**，消掉每行两趟 24KB F32 缓冲读写。
+- 按 32 值子块处理：`_mm256_srli_epi16` 拆 nibble → `cvtepu8_epi32` 转 f32 →
+  向量累加 `Σ q·x` 与 `Σ x`，子块末尾 `acc += d·Σqx − m·Σx`（与标量公式同构）。
+- Q4_K / Q6_K 两种 kernel；顺带 AVX2 化 `matvec_f16`（`_mm256_cvtph_ps` + FMA）。
+- 分发：编译期 `#ifdef __AVX2__`（构建已 `-march=native`），运行时 `--backend scalar|omp` 可回退；
+  标量路径保留作对照与对拍基准。
+
+### 验收
+
+| # | 项 | 判据 |
+|---|---|---|
+| 1 | AVX2 vs 标量 matvec 单元对拍 | 同张量点积，相对误差 < 1e-5（仅累加顺序差异） |
+| 2 | Q4 端到端 teacher 一致率 | ≥ 标量路径（49/50 基准），不得回退 |
+| 3 | F16 B4 抽查（50 token） | 逐 id 一致（若平局分叉则走 top-2 概率差预案） |
+| 4 | 性能 | Q4 decode ≥ 15 tok/s（目标区间 15-25）；F16 同步提升 |
+
+---
+
+## B6b CUDA 后端
+
+### 设计（生产形态：编排手写 + GEMM 走 cuBLAS）
+
+- **权重**：F16 整体驻留 VRAM（3.44GB，4060 8GB 从容）；norm F32；KV cache 全 GPU F32。
+- **GEMM/gemv**：`cublasGemmEx`（A=F16 存储、**F32 计算**、F32 输出）——
+  这正是 torch/cuBLAS 的生产路径；QKV/O/gate/up/down/logits 全部走它。
+- **编排算子自写 kernel**（小且教学价值高）：embed 行取、rmsnorm（block 归约）、
+  rope_neox、qk-norm、decode attention（每头一个 block：scores→softmax→加权 V）、
+  silu·up、残差 add。logits 拷回 host 做 argmax（600KB/步，~0.1ms，可接受）。
+- **数值口径**：与 CPU 版同一语义（F16 权重 F32 计算），容许 GPU 归约顺序差异，
+  用 allclose + teacher 实验验收。
+- 构建：`enable_language(CUDA)` + `find_package(CUDAToolkit)`，sm_89，guest 内 nvcc 12.0（A3 已装）；
+  `--backend cuda` 选择，CPU 路径完全不受影响。
+
+### 验收
+
+| # | 项 | 判据 |
+|---|---|---|
+| 1 | 逐层对拍 B3 CPU golden | allclose(atol 1e-3, rtol 1e-3)（GPU 归约顺序放宽一档） |
+| 2 | 端到端 vs llama.cpp **CUDA F16**（参照驱动 `-ngl 99`，位数对齐） | 5 prompt 逐 id 一致率 ≥95%（平局个案记录） |
+| 3 | 性能 | decode tok/s 对照 llama.cpp CUDA F16；目标 ≥ 其 50%（A3 实测 118.6，即 ≥59）……
+  现实预期 30-60（F16 访存瓶颈 3.44GB/272GB/s ≈ 79 上限），未达则做差距分解 |
+
+### 明确不做（两子项共同）
+
+Q4 on GPU（自定义 dequant kernel，后续项）、批量 prefill、多请求、PagedAttention、
+FlashAttention 融合、投机采样、多卡。
+
+### 风险
+
+1. cuBLAS 行主序/列主序约定搞反 → 第一层即全错，单元对拍兜底；
+2. WSL2 GPU 内存管理（默认动态分页）性能抖动 → 计时取中位、注明显存驻留；
+3. attention kernel 的 block 内 softmax 同步 bug → 与 CPU 逐步对拍定位；
+4. B6a 的 FMA 与标量累加顺序差异触发平局分叉 → teacher 实验口径验收。
+
+---
+
+## B6a 验收结果（2026-10-07 实测）
+
+| 项 | 结果 |
+|---|---|
+| SIMD 单元对拍（double 基准，误差按行项幅度归一） | ✅ AVX2 err 3-4e-8（**比标量 1.4e-7 更准**，8 路部分和），6/6 张量 OK |
+| F16 B4 抽查（50 token vs llama.cpp） | ✅ **仍逐 id 一致**（FMA 顺序变化未触发平局翻转） |
+| Q4 teacher 一致率 | ✅ 49/50，与标量路径持平 |
+| **Q4 AVX2 decode** | ✅ **17.3-18.0 tok/s**（标量 3.27 → **×5.4**；达 19 目标的 94%，距 llama.cpp Q4 37.9 仅 2.2×） |
+| **F16 AVX2 decode** | ✅ **9.9-10.3 tok/s**（omp 3.67 → ×2.8；达 llama.cpp F16 14.15 的 70%） |
+
+**首版单元测试阈值踩坑**：用"相对点积结果"判 1e-5 被 f32 累加噪音（对消场景 ~4e-4）误杀，
+改"double 基准 + 按行项幅度归一"后标量与 AVX2 同量级（~1e-7）——**误差归一化基准选错
+会把正确实现判成错**，已记录。
+
+---
+
+## B6b 验收结果（2026-10-07 实测）
+
+### 正确性（vs llama.cpp **CUDA F16**，位数对齐）
+
+| 用例 | 结果 |
+|---|---|
+| p1/p2/p4 中英算数 | ✅ **100/100 逐 id 一致** |
+| p3 chat 形态 | ✅ 40/40 一致（EOS 同位置） |
+| p5 领域计算题 | ⚠️ 31/100：**单个数值平局个案**——step 31 ref top-2 为 `43123:25.5171` vs `84141:25.5011`（**logit 差 0.016**），两侧 GPU 归约顺序不同落到另一侧；发散后各自生成均连贯（自研侧输出 ΔR=cτ/2 推理链完整）。按 docs/24 §5 预案记录，不视为缺陷 |
+
+### 性能（decode tok/s，100 token × 3 取中位）
+
+| 引擎 | tok/s | 对照 |
+|---|---|---|
+| **自研 CUDA F16** | **40.36** | 达 llama.cpp CUDA F16 的 **82%**（目标 ≥50% ✅ 超额） |
+| llama.cpp CUDA F16（--ngl 99） | 49.03 | 参照（注意：A3 的 118.6 是 Q4；F16 字节数 3.3×） |
+| 自研 CPU AVX2 F16 | 10.3 | CUDA 为其 3.9× |
+
+差距分析（40 vs 49）：每 token ~300 次 kernel launch 的开销 + attention/gemv 未融合 +
+gemv 未做 half2 向量化加载——方向明确，属优化项非语义差距。
+
+### 关键工程转折：弃 cuBLAS 改自研 gemv（两个独立理由）
+
+1. **环境**：Ubuntu 源 cuBLAS 12.0 的 libcublasLt 在本 WSL2 环境初始化即抛
+   `std::system_error`（hello world 正常、最小 cublas 调用即崩），且 GemmEx 要求
+   A/B 同类型（F16 权重 × F32 激活的组合需另加转换）；
+2. **生产对齐**：decode 形状的 gemv 是访存瓶颈，**llama.cpp / TensorRT-LLM 在 decode
+   路径同样用自定义 gemv kernel 而非 cuBLAS**（cuBLAS 的主战场是计算瓶颈的 GEMM）。
+   自研 gemv（block/行 + warp 归约）读取 F16 权重、F32 激活与累加，**数值口径与 CPU
+   参考完全一致**，且零外部库依赖。此决策反而强化了项目的生产叙事。
+
+### 回归
+
+AVX2 数值进入前向后复跑：B1 9/9、B2 3/3、B3 2/2 全绿（B3 logits max_abs 2.8e-5，
+较标量路径的 5.3e-5 更小——8 路部分和更准）。
+
+---
+
+## B6b 差距分析与 gemv v2（2026-10-07，profile 驱动优化）
+
+### 分段计时（CUDA events，RADAR_GPU_PROFILE=1，105 token 均值，v1）
+
+| 阶段 | ms/token | 占比 |
+|---|---|---|
+| 权重 gemv（28 层 × 7） | 19.15 | 76.8% |
+| logits gemv（2048×151936） | 3.74 | 15.0% |
+| attention | 0.41 | 1.7% |
+| logits D2H + host argmax | 0.36 | 1.4% |
+| 其余（小 kernel + launch 开销） | 1.27 | 5.1% |
+
+### 带宽账（实测，WSL2）
+
+- **WSL2 D2D 实测带宽 217.4 GB/s**（1GiB 拷贝 ×20，bw_probe.cu）——规格 272 是理论值，
+  217 就是真实天花板；**WSL2 对 GPU 带宽基本无损**（Windows 预留 ~700MB 是显存**容量**，
+  与 decode 速度无关；且两引擎同环境，对照公平）。
+- v1 层 gemv 效率：2.82GB / 19.15ms = **147 GB/s（天花板的 68%）**；
+  logits gemv 166 GB/s（77%）——同 kernel 同带宽、效率不同 → 锁定 kernel 内部问题。
+- 根因：v1 标量 2 字节加载，warp 每指令只利用 64/128 字节 cacheline（sector 效率减半）。
+
+### gemv v2：half2 向量化 + warp shuffle 归约（无 shared memory 链）
+
+| 指标 | v1 | v2 |
+|---|---|---|
+| decode tok/s（100 token 中位） | 40.36 | **62.52** |
+| 层 gemv ms/token | 19.15 | 15.92 |
+| 等效带宽 | 139 GB/s | **215 GB/s ≈ 实测天花板** |
+| 对拍 llama.cpp CUDA F16 | 4/5 全等 + 平局个案 | **5/5 全等**（p5 平局随累加顺序变化自然翻转回一致） |
+| vs llama.cpp（同 session 60.84） | 82% | **103%** |
+
+**结论：两者都已在访存屋顶线上（~215/217 GB/s），差距闭合。**
+剩余理论余量：CUDA Graphs 消 launch 开销（~5%）、Q4-on-GPU（字节 ÷3.3，
+带宽口径上限 ~200 tok/s；llama.cpp 实测 118.6 作参照）。

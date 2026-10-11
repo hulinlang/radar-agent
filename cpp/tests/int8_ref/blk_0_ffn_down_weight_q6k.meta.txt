@@ -1,0 +1,14 @@
+tensor blk.0.ffn_down.weight
+ggml_type 14
+in 6144
+out 2048
+nb 24
+ncol 16
+nrow 2048
+seed 24301
+x_fnv 92dc4f3f4d3d8b3a
+q8_fnv 8e1cc4a1e9944d1d
+y_fnv 30eb869f495f4636
+int8_vs_fp32act_max_rel 4.382459e-03
+int8_vs_dequantact_max_rel 1.537583e-07
+y_scale 2.977163e+02
