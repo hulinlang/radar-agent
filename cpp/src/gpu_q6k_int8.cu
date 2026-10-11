@@ -222,16 +222,32 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q6k_mma_kernel(
 
 void gemv_q6k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                   int in, int out, int ncol, int stride, cudaStream_t stream) {
-    constexpr int NTILE = 2;
     if (ncol <= 0 || in <= 0 || out <= 0) return;
     if (in % QK_K != 0 || out % 16 != 0) return;
-    // The B-fragment load touches columns [cb0, cb0+7] of the LAST group, so the
-    // activation buffer must be allocated to a whole number of column groups.
-    if (stride < ((ncol + NTILE * 8 - 1) / (NTILE * 8)) * NTILE * 8) return;
+    // RADAR_MMA_NTILE: N-tiles per A-fragment load. See gemv_q4k_mma; for Q6_K this
+    // is the lever the ablation pointed at (docs/37 §7.4).
+    static const int ntile = [] {
+        const char* e = std::getenv("RADAR_MMA_NTILE");
+        return e ? std::atoi(e) : 2;
+    }();
+    constexpr int WARPS = 4;
     const int ablate = q6k_ablate_level();
-    const dim3 grid((out / 16 + 3) / 4, (ncol + NTILE * 8 - 1) / (NTILE * 8));
-    gemv_q6k_mma_kernel<4, NTILE>
-        <<<grid, 4 * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
+    const dim3 g2((out / 16 + WARPS - 1) / WARPS, (ncol + 15) / 16);
+    const dim3 g4((out / 16 + WARPS - 1) / WARPS, (ncol + 31) / 32);
+    const dim3 g8((out / 16 + WARPS - 1) / WARPS, (ncol + 63) / 64);
+    if (ntile >= 8) {
+        if (stride < ((ncol + 63) / 64) * 64) return;
+        gemv_q6k_mma_kernel<WARPS, 8>
+            <<<g8, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
+    } else if (ntile >= 4) {
+        if (stride < ((ncol + 31) / 32) * 32) return;
+        gemv_q6k_mma_kernel<WARPS, 4>
+            <<<g4, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
+    } else {
+        if (stride < ((ncol + 15) / 16) * 16) return;
+        gemv_q6k_mma_kernel<WARPS, 2>
+            <<<g2, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
+    }
 }
 
 }  // namespace gpuq

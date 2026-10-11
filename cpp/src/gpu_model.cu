@@ -714,8 +714,20 @@ struct GpuModel::Impl {
     int kv_cap = 0;
     float *d_x, *d_h, *d_q, *d_k, *d_v, *d_att, *d_scores, *d_gate, *d_up, *d_ffn, *d_logits;
     float* h_logits = nullptr;        // pinned
-    // B8a batch-prefill buffers (MAX_MC columns per chunk)
-    static constexpr int MAX_MC = 16;
+    // B8a batch-prefill buffers.
+    //
+    // ⚠️ MAX_MC used to serve TWO roles: the prefill chunk width AND the max_batch
+    // cap. They are now split (docs/36 §7.5 point 1): widening the prefill width
+    // must not silently raise the batch cap, because d_scores is sized by
+    // kv_cap * n_head * max_batch and would grow with it.
+    static constexpr int MAX_MC = 16;       // batch cap (B8b padded decode batch)
+    // Worst-case prefill width. Buffers are allocated for this; the width actually
+    // used is `prefill_w` (runtime, RADAR_PREFILL_W), so a W sweep needs no rebuild.
+    // Why widen W at all: B13's ablation showed the Q6_K kernel is neither
+    // extraction- nor bandwidth-bound but latency/parallelism-bound -- only ~5.3
+    // warps per SM are available at W=16 (out/16 warps total), and widening W
+    // lengthens the MMA batch per A-fragment load (docs/37 §7.4).
+    static constexpr int MAX_PREFILL = 64;
     float *d_xm = nullptr, *d_hm = nullptr, *d_qm = nullptr, *d_km = nullptr,
           *d_vm = nullptr, *d_attm = nullptr, *d_gatem = nullptr, *d_upm = nullptr,
           *d_ffnm = nullptr;
@@ -723,9 +735,10 @@ struct GpuModel::Impl {
     // RADAR_Q4_FP32_ACT=1 forces the pre-B11 fp32-activation route, which is
     // what makes D3/D4 paired same-session measurements possible (docs/34 §3.5).
     bool int8_act = true;
-    int8_t* d_q8s = nullptr;        // [MAX_MC][q8_k] int8 activation quants
-    Q8_1Ds* d_q8ds = nullptr;       // [MAX_MC][q8_k/32] scales + exact sums
+    int8_t* d_q8s = nullptr;        // [MAX_PREFILL][q8_k] int8 activation quants
+    Q8_1Ds* d_q8ds = nullptr;       // [MAX_PREFILL][q8_k/32] scales + exact sums
     int q8_k = 0;                   // allocated k (max of the gemv input dims)
+    int prefill_w = MAX_MC;         // actual prefill chunk width (<= MAX_PREFILL)
     int tile_rw = gpuq::B11_TILE_RW;   // RADAR_B11_TILE=RxC, measurement knob only
     int tile_nc = gpuq::B11_TILE_NC;
     // B12: RADAR_Q4_MMA=1 switches the int8 prefill GEMM from __dp4a to the
@@ -844,17 +857,17 @@ struct GpuModel::Impl {
         const bool int8_ok = int8_act && in <= q8_k &&
                              (w.type == 12 || (w.type == 14 && q6k_int8));
         if (int8_ok) {
-            gpuq::quantize_q8_1(x, d_q8s, d_q8ds, in, MAX_MC, stream);
+            gpuq::quantize_q8_1(x, d_q8s, d_q8ds, in, MAX_PREFILL, stream);
             if (w.type == 12) {
                 // B12: tensor-core route. Both branches consume the same Q8_1
                 // buffers and are bit-exact with each other, so the switch only
-                // moves the inner loop (docs/36 §7.7). `stride = MAX_MC` because
-                // the activation layout always carries MAX_MC columns;
-                // gemv_q4k_mma checks that the stride covers the last column
-                // group and no-ops otherwise.
+                // moves the inner loop (docs/36 §7.7). `stride = MAX_PREFILL`
+                // because that is the allocated column count of the activation
+                // layout; `ncol` is the number of VALID columns. The kernels check
+                // that the stride covers the last column group and no-op otherwise.
                 if (mma && out % 16 == 0) {
                     gpuq::gemv_q4k_mma(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
-                                       out, ncol, MAX_MC, stream);
+                                       out, ncol, MAX_PREFILL, stream);
                 } else {
                     gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y,
                                              in, out, ncol, tile_rw, tile_nc, stream);
@@ -864,7 +877,7 @@ struct GpuModel::Impl {
                 // scale granularity (docs/37 §7.1). The dp4a intermediate step
                 // was skipped as low-value (docs/37 §7.3).
                 gpuq::gemv_q6k_mma(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
-                                   out, ncol, MAX_MC, stream);
+                                   out, ncol, MAX_PREFILL, stream);
             }
         } else {
             gemv_mc(w, x, y, in, out, ncol);
@@ -1373,8 +1386,8 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
         CU_CHECK(cudaMallocHost(&m->h_bstage, 3 * max_batch * sizeof(int)));
         CU_CHECK(cudaMallocHost(&m->h_next, max_batch * sizeof(int32_t)));
     }
-    // B8a batch-prefill buffers
-    const int MC = Impl::MAX_MC;
+    // B8a batch-prefill buffers, sized for the WORST-CASE prefill width.
+    const int MC = Impl::MAX_PREFILL;
     CU_CHECK(cudaMalloc(&m->d_xm, static_cast<size_t>(MC) * H * 4));
     CU_CHECK(cudaMalloc(&m->d_hm, static_cast<size_t>(MC) * H * 4));
     CU_CHECK(cudaMalloc(&m->d_qm, static_cast<size_t>(MC) * Q * 4));
@@ -1389,6 +1402,23 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     // RADAR_Q4_FP32_ACT=1 restores the pre-B11 fp32-activation route for the
     // quantized weights (same-session A/B, docs/34 §3.5).
     m->int8_act = std::getenv("RADAR_Q4_FP32_ACT") == nullptr;
+    // B13 step 8: RADAR_PREFILL_W selects the prefill chunk width (1..MAX_PREFILL).
+    // Runtime, not compile time, so a W sweep needs no rebuild. Per-column
+    // arithmetic is independent of W (B8a proved multi-column bitwise-equals
+    // single-column), so changing W must NOT change any id -- that is the safety net
+    // for this refactor, which otherwise touches every B8a buffer.
+    m->prefill_w = Impl::MAX_MC;
+    if (const char* pw = std::getenv("RADAR_PREFILL_W")) {
+        int v = std::atoi(pw);
+        if (v >= 1 && v <= Impl::MAX_PREFILL) {
+            m->prefill_w = v;
+        } else {
+            std::fprintf(stderr, "[b13] ignoring RADAR_PREFILL_W=%s (want 1..%d)\n", pw,
+                         Impl::MAX_PREFILL);
+        }
+    }
+    std::fprintf(stderr, "[b13] prefill width W=%d (allocated %d; RADAR_PREFILL_W)\n",
+                 m->prefill_w, Impl::MAX_PREFILL);
     m->q8_k = std::max(std::max(H, Q), std::max(KV, FF));
     CU_CHECK(cudaMalloc(&m->d_q8s, static_cast<size_t>(MC) * m->q8_k));
     CU_CHECK(cudaMalloc(&m->d_q8ds,
@@ -1524,8 +1554,9 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
     if (skip > 0)
         std::fprintf(stderr, "[b10] prefix reuse: slot=%d prompt=%d reused=%d computed=%d\n",
                      slot, n, skip, n - skip);
-    for (int base = skip; base < n; base += Impl::MAX_MC) {
-        const int nr = std::min(static_cast<int>(Impl::MAX_MC), n - base);
+    const int W = m->prefill_w;   // runtime prefill width (<= MAX_PREFILL)
+    for (int base = skip; base < n; base += W) {
+        const int nr = std::min(W, n - base);
         CU_CHECK(cudaMemcpyAsync(m->d_tokens, tokens + base, nr * sizeof(int),
                                  cudaMemcpyHostToDevice, m->stream));
         m->prof_begin(Impl::PH_TOTAL);
@@ -1533,7 +1564,7 @@ void GpuModel::prefill_batch(const int32_t* tokens, int n, float* logits_out,
         m->prof_end(Impl::PH_TOTAL);
         m->prof_collect();
     }
-    const int last = (n - 1 - skip) % Impl::MAX_MC;  // row of the last position
+    const int last = (n - 1 - skip) % W;  // row of the last position
     m->prof_begin(Impl::PH_LOGITS);
     m->gemv(m->d_embd, m->d_hm + static_cast<size_t>(last) * c.hidden,
             m->d_logits, c.hidden, c.vocab);

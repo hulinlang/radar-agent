@@ -356,7 +356,7 @@ template <int RW, int NC, int LC>
 __global__ void gemv_q4k_q8_1_kernel(const uint8_t* __restrict__ w,
                                      const int8_t* __restrict__ qs,
                                      const Q8_1Ds* __restrict__ ds,
-                                     float* __restrict__ y, int in, int out) {
+                                     float* __restrict__ y, int in, int out, int ncol) {
     const int lane = threadIdx.x & 31;
     const int r_local = lane / NC;
     const int c_in = lane - r_local * NC;
@@ -369,6 +369,11 @@ __global__ void gemv_q4k_q8_1_kernel(const uint8_t* __restrict__ w,
 #pragma unroll
     for (int c0 = 0; c0 < LC; c0 += NC) {
         const int c = c0 + c_in;
+        // ⚠️ LC is the ALLOCATED column count (the activation stride) and is now
+        // larger than the chunk width, so columns >= ncol are padding: skip them or
+        // the store y[c*out+row] would run past the caller's buffer. This was a
+        // latent out-of-bounds write while LC == 16 == the chunk width.
+        if (c >= ncol) continue;
         // Activation layout is [k/32][LC][32]: one block's columns are contiguous.
         const int8_t* qc = qs + static_cast<size_t>(c) * 32;
         const Q8_1Ds* dc = ds + c;
@@ -448,20 +453,37 @@ void gemv_q4k_mc(const uint8_t* w, const float* x, float* y, int in, int out,
     if (ncol <= 1) { gemv_q4k(w, x, y, in, out, stream); return; }
     // 4 warps per block, R rows per warp
     auto grid_for = [out](int r) { return ((out + r - 1) / r + 3) / 4; };
-    if (ncol <= 2) gemv_q4k_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else if (ncol <= 4) gemv_q4k_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else if (ncol <= 8) gemv_q4k_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else gemv_q4k_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, x, y, in, out);
+    // ⚠️ The kernel maps the 32 lanes to R*NC (row, column) pairs, so NC tops out
+    // at 16 here. The dispatch USED to end at NC=16 with no fallback, which was
+    // invisible only because the prefill width was itself 16. Widening W (docs/37
+    // §7.6) exposed it: columns 16.. came back silently UNWRITTEN. Serve wider
+    // chunks by iterating 16-column groups with offset pointers; the arithmetic per
+    // column is unchanged, so this stays bitwise-equal to the single-group launch.
+    for (int done = 0; done < ncol; done += 16) {
+        const int nc = (ncol - done >= 16) ? 16 : (ncol - done);
+        const float* xc = x + static_cast<size_t>(done) * in;
+        float* yc = y + static_cast<size_t>(done) * out;
+        if (nc <= 2) gemv_q4k_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else if (nc <= 4) gemv_q4k_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else if (nc <= 8) gemv_q4k_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else gemv_q4k_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, xc, yc, in, out);
+    }
 }
 
 void gemv_q6k_mc(const uint8_t* w, const float* x, float* y, int in, int out,
                  int ncol, cudaStream_t stream) {
     if (ncol <= 1) { gemv_q6k(w, x, y, in, out, stream); return; }
     auto grid_for = [out](int r) { return ((out + r - 1) / r + 3) / 4; };
-    if (ncol <= 2) gemv_q6k_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else if (ncol <= 4) gemv_q6k_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else if (ncol <= 8) gemv_q6k_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else gemv_q6k_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, x, y, in, out);
+    // Same 16-column ceiling and the same fix as gemv_q4k_mc above.
+    for (int done = 0; done < ncol; done += 16) {
+        const int nc = (ncol - done >= 16) ? 16 : (ncol - done);
+        const float* xc = x + static_cast<size_t>(done) * in;
+        float* yc = y + static_cast<size_t>(done) * out;
+        if (nc <= 2) gemv_q6k_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else if (nc <= 4) gemv_q6k_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else if (nc <= 8) gemv_q6k_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else gemv_q6k_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, xc, yc, in, out);
+    }
 }
 
 void embed_row_q6k(const uint8_t* embd, float* x, const int* token_p, int hidden,
@@ -490,35 +512,43 @@ void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* 
 
 void gemv_q4k_q8_1_tile(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                         int in, int out, int ncol, int rw, int nc, cudaStream_t stream) {
-    (void)ncol;   // the activation layout always carries LC = 16 columns
-    constexpr int LC = 16;
+    // LC is the ALLOCATED activation stride, which is now the worst-case prefill
+    // width and no longer equals the chunk width. `ncol` (valid columns) is passed
+    // down so the kernel can skip the padding columns -- otherwise it would write
+    // y past the caller's buffer (a latent OOB while LC == 16 == the width).
+    constexpr int LC = B11_LC;
     constexpr int WPB = 4;   // warps per block
     // rows_per_block = RW * WPB, so the grid is ceil(out / (RW * 4)).
     switch (rw * 100 + nc) {
         case 2 * 100 + 16:
             gemv_q4k_q8_1_kernel<2, 16, LC>
-                <<<(out + 2 * WPB - 1) / (2 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+                <<<(out + 2 * WPB - 1) / (2 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                     ncol);
             break;
         case 4 * 100 + 8:
             gemv_q4k_q8_1_kernel<4, 8, LC>
-                <<<(out + 4 * WPB - 1) / (4 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+                <<<(out + 4 * WPB - 1) / (4 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                     ncol);
             break;
         case 8 * 100 + 4:
             gemv_q4k_q8_1_kernel<8, 4, LC>
-                <<<(out + 8 * WPB - 1) / (8 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+                <<<(out + 8 * WPB - 1) / (8 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                     ncol);
             break;
         case 16 * 100 + 2:
             gemv_q4k_q8_1_kernel<16, 2, LC>
-                <<<(out + 16 * WPB - 1) / (16 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+                <<<(out + 16 * WPB - 1) / (16 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                       ncol);
             break;
         case 32 * 100 + 1:
             gemv_q4k_q8_1_kernel<32, 1, LC>
-                <<<(out + 32 * WPB - 1) / (32 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out);
+                <<<(out + 32 * WPB - 1) / (32 * WPB), 128, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                       ncol);
             break;
         default:
             gemv_q4k_q8_1_kernel<B11_TILE_RW, B11_TILE_NC, LC>
                 <<<(out + B11_TILE_RW * WPB - 1) / (B11_TILE_RW * WPB), 128, 0, stream>>>(
-                    w, qs, ds, y, in, out);
+                    w, qs, ds, y, in, out, ncol);
             break;
     }
 }

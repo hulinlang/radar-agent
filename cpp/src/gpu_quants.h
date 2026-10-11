@@ -72,6 +72,14 @@ void quantize_q8_1(const float* x, int8_t* qs, Q8_1Ds* ds, int k, int ncol,
 inline constexpr int B11_TILE_RW = 2;
 inline constexpr int B11_TILE_NC = 16;
 
+// B13 step 8: the ALLOCATED activation stride (column count) for the int8 route.
+// It used to be 16 = the chunk width, which conflated "how many columns exist" with
+// "how many are valid". Widening the prefill width (docs/37 §7.4: the Q6_K kernel
+// is latency-bound at W=16, so each weight load must feed more MMAs) requires them
+// to be separate: LC is the stride of the Q8_1 layout, while `ncol` is the number of
+// valid columns. Must match MAX_PREFILL in gpu_model.cu.
+inline constexpr int B11_LC = 64;
+
 void gemv_q4k_q8_1(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                    int in, int out, int ncol, cudaStream_t stream = nullptr);
 // Explicit tile, for the sweep and for regression-testing a specific shape.

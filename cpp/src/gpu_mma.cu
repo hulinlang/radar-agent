@@ -183,29 +183,32 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q4k_mma_kernel(
 
 void gemv_q4k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                   int in, int out, int ncol, int stride, cudaStream_t stream) {
-    constexpr int NTILE = 2;
-    if (ncol <= 0 || in <= 0 || out <= 0) return;
-    if (in % QK_K != 0 || out % 16 != 0) return;
+    // RADAR_MMA_NTILE: how many 8-column tiles one warp chews per A-fragment load.
+    // This is the whole point of widening W (docs/37 §7.4): the Q6_K kernel is
+    // latency-bound at W=16 because ~5.3 warps/SM is all the parallelism out/16
+    // allows, so the fix is to make each A build feed more MMAs.
+    static const int ntile = [] {
+        const char* e = std::getenv("RADAR_MMA_NTILE");
+        return e ? std::atoi(e) : 2;
+    }();
+    constexpr int WARPS = 4;
+    const dim3 g2((out / 16 + WARPS - 1) / WARPS, (ncol + 15) / 16);
+    const dim3 g4((out / 16 + WARPS - 1) / WARPS, (ncol + 31) / 32);
+    const dim3 g8((out / 16 + WARPS - 1) / WARPS, (ncol + 63) / 64);
     // The B-fragment load touches columns [cb0, cb0+7] of the LAST group, so the
     // activation buffer must be allocated to a whole number of column groups.
-    if (stride < ((ncol + NTILE * 8 - 1) / (NTILE * 8)) * NTILE * 8) return;
-    const dim3 grid((out / 16 + 3) / 4, (ncol + NTILE * 8 - 1) / (NTILE * 8));
-    // RADAR_MMA_WARPS: occupancy knob for the same-session A/B. With a 16-column
-    // chunk a warp's MMA batch is short and it immediately reads the result back
-    // (the reference's per-sub-block scaling forbids folding j into the int32
-    // accumulator), so the tensor-core pipeline is latency-exposed; more warps per
-    // block is the cheapest lever on that.
-    static const int warps = [] {
-        const char* e = std::getenv("RADAR_MMA_WARPS");
-        return e ? std::atoi(e) : 4;
-    }();
-    if (warps >= 8) {
-        gemv_q4k_mma_kernel<8, NTILE>
-            <<<dim3((out / 16 + 7) / 8, grid.y), 8 * 32, 0, stream>>>(w, qs, ds, y, in, out,
-                                                                     ncol, stride);
+    if (ntile >= 8) {
+        if (stride < ((ncol + 63) / 64) * 64) return;
+        gemv_q4k_mma_kernel<WARPS, 8>
+            <<<g8, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+    } else if (ntile >= 4) {
+        if (stride < ((ncol + 31) / 32) * 32) return;
+        gemv_q4k_mma_kernel<WARPS, 4>
+            <<<g4, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
     } else {
-        gemv_q4k_mma_kernel<4, NTILE>
-            <<<grid, 4 * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+        if (stride < ((ncol + 15) / 16) * 16) return;
+        gemv_q4k_mma_kernel<WARPS, 2>
+            <<<g2, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
     }
 }
 
