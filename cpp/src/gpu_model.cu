@@ -41,9 +41,12 @@ namespace {
 // Environment flag with "off" expressible: present and not "0". A bare
 // getenv-presence test cannot be turned off from the outside, which is how an A/B
 // script ended up comparing MMA against MMA (see the RADAR_Q4_MMA site).
-bool env_on(const char* name) {
+// `dflt` is what an unset variable means -- B13 turned the fast route into the
+// default (docs/37 §7.7), so these flags are default-ON and `=0` restores the
+// older behaviour.
+bool env_flag(const char* name, bool dflt) {
     const char* v = std::getenv(name);
-    if (v == nullptr) return false;
+    if (v == nullptr) return dflt;
     return !(v[0] == '0' && v[1] == '\0');
 }
 
@@ -697,10 +700,23 @@ void gemv_f16_mc(const __half* w, const float* x, float* y, int in, int out,
     const int grid = (out + 3) / 4;
     if (ncol <= 1) { gemv_f16_v2<<<grid, 128, 0, stream>>>(w, x, y, in, out); return; }
     auto grid_for = [out](int r) { return ((out + r - 1) / r + 3) / 4; };
-    if (ncol <= 2) gemv_f16_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else if (ncol <= 4) gemv_f16_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else if (ncol <= 8) gemv_f16_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, x, y, in, out);
-    else gemv_f16_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, x, y, in, out);
+    // ⚠️ Same 16-column ceiling as gemv_q4k_mc / gemv_q6k_mc, and the same latent
+    // hole: the kernel maps 32 lanes onto R*NC outputs so NC tops out at 16, and the
+    // dispatch used to have no fallback. Invisible while the prefill width was 16;
+    // B13's W widening exposed it as silently unwritten columns. This one shows up
+    // as an ID DIVERGENCE on a degenerate prompt (test_b6 p4 "1+1=2. 3+5=8. 7+9=",
+    // 1/100 tokens) rather than as a crash -- i.e. exactly the kind of bug the D5
+    // regression suite exists for. Iterate 16-column groups with offset pointers:
+    // per-column arithmetic is unchanged, so this stays bitwise-equal to one launch.
+    for (int done = 0; done < ncol; done += 16) {
+        const int nc = (ncol - done >= 16) ? 16 : (ncol - done);
+        const float* xc = x + static_cast<size_t>(done) * in;
+        float* yc = y + static_cast<size_t>(done) * out;
+        if (nc <= 2) gemv_f16_mc_kernel<4, 2><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else if (nc <= 4) gemv_f16_mc_kernel<4, 4><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else if (nc <= 8) gemv_f16_mc_kernel<4, 8><<<grid_for(4), 128, 0, stream>>>(w, xc, yc, in, out);
+        else gemv_f16_mc_kernel<2, 16><<<grid_for(2), 128, 0, stream>>>(w, xc, yc, in, out);
+    }
 }
 
 }  // namespace gpuq
@@ -1408,7 +1424,11 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     // arithmetic is independent of W (B8a proved multi-column bitwise-equals
     // single-column), so changing W must NOT change any id -- that is the safety net
     // for this refactor, which otherwise touches every B8a buffer.
-    m->prefill_w = Impl::MAX_MC;
+    //
+    // Default is now MAX_PREFILL: W=64 with NTILE=4 measured 2.09x the W=16 config
+    // (docs/37 §7.6), and it is id-preserving, so the old width is reachable with
+    // RADAR_PREFILL_W=16.
+    m->prefill_w = Impl::MAX_PREFILL;
     if (const char* pw = std::getenv("RADAR_PREFILL_W")) {
         int v = std::atoi(pw);
         if (v >= 1 && v <= Impl::MAX_PREFILL) {
@@ -1436,14 +1456,16 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
             std::fprintf(stderr, "[b11] ignoring malformed RADAR_B11_TILE=%s\n", tile);
         }
     }
-    // B12: RADAR_Q4_MMA=1 -> tensor-core inner loop. Bit-exact with the dp4a
-    // route (int8-ref-test proves both against the NumPy reference), so this is
-    // purely a throughput switch and can be A/B'd inside one session.
+    // B12/B13: the int8 tensor-core route is now the DEFAULT (docs/37 §7.7).
+    // Both switches are id-preserving (verified W-invariant AND identical to the
+    // dp4a route), and the Q6_K side additionally has D2 49/50 + D4 0 flips over
+    // 205 steps. RADAR_Q4_MMA=0 / RADAR_Q6K_INT8=0 restore the older routes, and
+    // RADAR_Q4_FP32_ACT=1 still forces the original all-fp32 route.
     //
-    // ⚠️ Uses env_on, not getenv-presence: a presence test makes `RADAR_Q4_MMA=0`
-    // mean ON, which silently made an A/B script compare MMA against MMA and
-    // produced a wrong "dp4a and MMA are equal" conclusion (2026-10-11).
-    m->mma = env_on("RADAR_Q4_MMA");
+    // ⚠️ Uses env_flag, not getenv-presence: a presence test makes `...=0` mean ON,
+    // which silently made an A/B script compare MMA against MMA and produced a
+    // wrong "dp4a and MMA are equal" conclusion (2026-10-11).
+    m->mma = env_flag("RADAR_Q4_MMA", true);
     std::fprintf(stderr, "[b11] int8 activations %s (prefill, quantized weights only; tile %dx%d)\n",
                  m->int8_act ? "ON" : "OFF (RADAR_Q4_FP32_ACT)", m->tile_rw, m->tile_nc);
     if (m->int8_act) {
@@ -1454,7 +1476,12 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
     // B13: Q6_K on the int8 route. Default OFF -- this one DOES change end-to-end
     // ids (int8 activation quantisation loses precision), unlike B12's pure
     // instruction swap, so it is a Tier-B change (docs/37 §1.1).
-    m->q6k_int8 = env_on("RADAR_Q6K_INT8");
+    // B13: Q6_K on the int8 route, default ON as of the B13 closeout. This one IS
+    // a numerical change (int8 activation quantisation loses precision), so it
+    // carries its own evidence: D2 teacher-forcing 49/50 (identical to the dp4a and
+    // fp32 routes) and D4 0 top-1 flips over 205 steps (docs/37 §7.7).
+    // RADAR_Q6K_INT8=0 restores the B11/B12 behaviour (Q6_K on the fp32 route).
+    m->q6k_int8 = env_flag("RADAR_Q6K_INT8", true);
     std::fprintf(stderr, "[b13] Q6_K prefill: %s\n",
                  (m->int8_act && m->q6k_int8)
                      ? "int8 m16n8k16 (tensor cores; RADAR_Q6K_INT8)"

@@ -226,27 +226,32 @@ void gemv_q6k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y
     if (in % QK_K != 0 || out % 16 != 0) return;
     // RADAR_MMA_NTILE: N-tiles per A-fragment load. See gemv_q4k_mma; for Q6_K this
     // is the lever the ablation pointed at (docs/37 §7.4).
-    static const int ntile = [] {
+    static const int ntile_env = [] {
         const char* e = std::getenv("RADAR_MMA_NTILE");
-        return e ? std::atoi(e) : 2;
+        return e ? std::atoi(e) : 4;   // default 4: the measured sweet spot (docs/37 §7.6)
     }();
     constexpr int WARPS = 4;
     const int ablate = q6k_ablate_level();
-    const dim3 g2((out / 16 + WARPS - 1) / WARPS, (ncol + 15) / 16);
-    const dim3 g4((out / 16 + WARPS - 1) / WARPS, (ncol + 31) / 32);
-    const dim3 g8((out / 16 + WARPS - 1) / WARPS, (ncol + 63) / 64);
-    if (ntile >= 8) {
-        if (stride < ((ncol + 63) / 64) * 64) return;
+    // Same stride-derived tile selection as gemv_q4k_mma: NEVER silently no-op,
+    // because a return would leave y untouched (see the note there).
+    int nt = 0;
+    if (ntile_env >= 8 && ((ncol + 63) / 64) * 64 <= stride) nt = 8;
+    else if (ntile_env >= 4 && ((ncol + 31) / 32) * 32 <= stride) nt = 4;
+    else if (((ncol + 15) / 16) * 16 <= stride) nt = 2;
+    if (nt == 0) return;
+    const int gx = (out / 16 + WARPS - 1) / WARPS;
+    if (nt == 8) {
         gemv_q6k_mma_kernel<WARPS, 8>
-            <<<g8, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
-    } else if (ntile >= 4) {
-        if (stride < ((ncol + 31) / 32) * 32) return;
+            <<<dim3(gx, (ncol + 63) / 64), WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                   ncol, stride, ablate);
+    } else if (nt == 4) {
         gemv_q6k_mma_kernel<WARPS, 4>
-            <<<g4, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
+            <<<dim3(gx, (ncol + 31) / 32), WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                   ncol, stride, ablate);
     } else {
-        if (stride < ((ncol + 15) / 16) * 16) return;
         gemv_q6k_mma_kernel<WARPS, 2>
-            <<<g2, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride, ablate);
+            <<<dim3(gx, (ncol + 15) / 16), WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                   ncol, stride, ablate);
     }
 }
 

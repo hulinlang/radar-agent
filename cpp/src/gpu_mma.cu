@@ -187,28 +187,34 @@ void gemv_q4k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y
     // This is the whole point of widening W (docs/37 §7.4): the Q6_K kernel is
     // latency-bound at W=16 because ~5.3 warps/SM is all the parallelism out/16
     // allows, so the fix is to make each A build feed more MMAs.
-    static const int ntile = [] {
+    static const int ntile_env = [] {
         const char* e = std::getenv("RADAR_MMA_NTILE");
-        return e ? std::atoi(e) : 2;
+        return e ? std::atoi(e) : 4;   // default 4: the measured sweet spot (docs/37 §7.6)
     }();
     constexpr int WARPS = 4;
-    const dim3 g2((out / 16 + WARPS - 1) / WARPS, (ncol + 15) / 16);
-    const dim3 g4((out / 16 + WARPS - 1) / WARPS, (ncol + 31) / 32);
-    const dim3 g8((out / 16 + WARPS - 1) / WARPS, (ncol + 63) / 64);
-    // The B-fragment load touches columns [cb0, cb0+7] of the LAST group, so the
-    // activation buffer must be allocated to a whole number of column groups.
-    if (ntile >= 8) {
-        if (stride < ((ncol + 63) / 64) * 64) return;
+    // Pick the largest tile count <= the request that the ALLOCATED stride can
+    // serve. Deriving it from the stride (rather than returning on mismatch) matters:
+    // a silent return leaves y untouched, which is exactly how the first version of
+    // this guard failed all of layer 1 on CUDA (stride=16 from the golden payloads
+    // vs an NTILE=4 request needing 32).
+    int nt = 0;
+    if (ntile_env >= 8 && ((ncol + 63) / 64) * 64 <= stride) nt = 8;
+    else if (ntile_env >= 4 && ((ncol + 31) / 32) * 32 <= stride) nt = 4;
+    else if (((ncol + 15) / 16) * 16 <= stride) nt = 2;
+    if (nt == 0) return;   // caller contract violated: stride < round_up(ncol, 16)
+    const int gx = (out / 16 + WARPS - 1) / WARPS;
+    if (nt == 8) {
         gemv_q4k_mma_kernel<WARPS, 8>
-            <<<g8, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
-    } else if (ntile >= 4) {
-        if (stride < ((ncol + 31) / 32) * 32) return;
+            <<<dim3(gx, (ncol + 63) / 64), WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                   ncol, stride);
+    } else if (nt == 4) {
         gemv_q4k_mma_kernel<WARPS, 4>
-            <<<g4, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+            <<<dim3(gx, (ncol + 31) / 32), WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                   ncol, stride);
     } else {
-        if (stride < ((ncol + 15) / 16) * 16) return;
         gemv_q4k_mma_kernel<WARPS, 2>
-            <<<g2, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+            <<<dim3(gx, (ncol + 15) / 16), WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                   ncol, stride);
     }
 }
 
