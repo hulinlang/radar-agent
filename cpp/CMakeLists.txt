@@ -98,6 +98,12 @@ if(CMAKE_CUDA_COMPILER)
   add_executable(b12-roof tests/b12_roof.cu)
   target_link_libraries(b12-roof PRIVATE CUDA::cudart)
   set_target_properties(b12-roof PROPERTIES CUDA_ARCHITECTURES "89")
+# B14：attention 重写前的两个分母 —— ① 同会话 FFMA 峰值（跨会话漂移 ~30%，
+#   拿上次的峰值算利用率不成立）② attention 工作集下的 L2 常驻读带宽。
+#   用来区分"被 L2 带宽卡住（解法 = tile 复用）"和"只是延迟受限（解法 = ILP）"。
+  add_executable(b14-roof tests/b14_roof.cu)
+  target_link_libraries(b14-roof PRIVATE CUDA::cudart)
+  set_target_properties(b14-roof PROPERTIES CUDA_ARCHITECTURES "89")
 # B11：层①对拍的 CUDA 半边（同一份参考文件，逐元素 bit-exact）
   add_executable(int8-ref-test-cuda src/gguf.cpp src/int8_act.cpp tests/int8_ref_test.cpp)
   target_include_directories(int8-ref-test-cuda PRIVATE src)
