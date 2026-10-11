@@ -719,6 +719,10 @@ struct GpuModel::Impl {
     int q8_k = 0;                   // allocated k (max of the gemv input dims)
     int tile_rw = gpuq::B11_TILE_RW;   // RADAR_B11_TILE=RxC, measurement knob only
     int tile_nc = gpuq::B11_TILE_NC;
+    // B12: RADAR_Q4_MMA=1 switches the int8 prefill GEMM from __dp4a to the
+    // m16n8k32 tensor-core instruction. Off by default so the B11 record stays
+    // reproducible; it is bit-exact with the dp4a route either way.
+    bool mma = false;
     int* d_tokens = nullptr;
     // B8b slot pool + batch decode state
     int max_batch = 1;
@@ -823,8 +827,18 @@ struct GpuModel::Impl {
     void gemv_prefill(const DevWeight& w, const float* x, float* y, int in, int out, int ncol) {
         if (int8_act && w.type == 12 && in <= q8_k) {
             gpuq::quantize_q8_1(x, d_q8s, d_q8ds, in, MAX_MC, stream);
-            gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
-                                     out, ncol, tile_rw, tile_nc, stream);
+            // B12: tensor-core route. Both branches consume the same Q8_1 buffers
+            // and are bit-exact with each other, so the switch only moves the
+            // inner loop (docs/36 §7.7). `stride = MAX_MC` because the activation
+            // layout always carries MAX_MC columns; gemv_q4k_mma checks that the
+            // stride covers the last column group and no-ops otherwise.
+            if (mma && out % 16 == 0) {
+                gpuq::gemv_q4k_mma(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
+                                   out, ncol, MAX_MC, stream);
+            } else {
+                gpuq::gemv_q4k_q8_1_tile(static_cast<const uint8_t*>(w.p), d_q8s, d_q8ds, y, in,
+                                         out, ncol, tile_rw, tile_nc, stream);
+            }
         } else {
             gemv_mc(w, x, y, in, out, ncol);
         }
@@ -1364,8 +1378,17 @@ GpuModel GpuModel::load(const GGUFFile& f, int kv_cap, int max_batch, int num_bl
             std::fprintf(stderr, "[b11] ignoring malformed RADAR_B11_TILE=%s\n", tile);
         }
     }
+    // B12: RADAR_Q4_MMA=1 -> tensor-core inner loop. Bit-exact with the dp4a
+    // route (int8-ref-test proves both against the NumPy reference), so this is
+    // purely a throughput switch and can be A/B'd inside one session.
+    m->mma = std::getenv("RADAR_Q4_MMA") != nullptr;
     std::fprintf(stderr, "[b11] int8 activations %s (prefill, quantized weights only; tile %dx%d)\n",
                  m->int8_act ? "ON" : "OFF (RADAR_Q4_FP32_ACT)", m->tile_rw, m->tile_nc);
+    if (m->int8_act) {
+        std::fprintf(stderr, "[b12] prefill GEMM inner loop: %s\n",
+                     m->mma ? "int8 MMA (m16n8k32, tensor cores; RADAR_Q4_MMA)"
+                            : "dp4a (B11 default; set RADAR_Q4_MMA=1 for the MMA route)");
+    }
     CU_CHECK(cudaDeviceSynchronize());
     m->prof_init();
     // CUDA graph replay per decode token (RADAR_NO_CUDA_GRAPH=1 to force eager;

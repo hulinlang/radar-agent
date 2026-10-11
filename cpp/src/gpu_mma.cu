@@ -28,6 +28,7 @@
 // 1.77 ops/value), which is NOT this layout and overstated the cost ~4.7x.
 
 #include <cstdint>
+#include <cstdlib>
 
 #include <cuda_runtime.h>
 
@@ -182,16 +183,30 @@ __global__ void __launch_bounds__(WARPS * 32) gemv_q4k_mma_kernel(
 
 void gemv_q4k_mma(const uint8_t* w, const int8_t* qs, const Q8_1Ds* ds, float* y,
                   int in, int out, int ncol, int stride, cudaStream_t stream) {
-    constexpr int WARPS = 4, NTILE = 2;
+    constexpr int NTILE = 2;
     if (ncol <= 0 || in <= 0 || out <= 0) return;
     if (in % QK_K != 0 || out % 16 != 0) return;
     // The B-fragment load touches columns [cb0, cb0+7] of the LAST group, so the
     // activation buffer must be allocated to a whole number of column groups.
     if (stride < ((ncol + NTILE * 8 - 1) / (NTILE * 8)) * NTILE * 8) return;
-    const dim3 grid((out / 16 + WARPS - 1) / WARPS,
-                    (ncol + NTILE * 8 - 1) / (NTILE * 8));
-    gemv_q4k_mma_kernel<WARPS, NTILE>
-        <<<grid, WARPS * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+    const dim3 grid((out / 16 + 3) / 4, (ncol + NTILE * 8 - 1) / (NTILE * 8));
+    // RADAR_MMA_WARPS: occupancy knob for the same-session A/B. With a 16-column
+    // chunk a warp's MMA batch is short and it immediately reads the result back
+    // (the reference's per-sub-block scaling forbids folding j into the int32
+    // accumulator), so the tensor-core pipeline is latency-exposed; more warps per
+    // block is the cheapest lever on that.
+    static const int warps = [] {
+        const char* e = std::getenv("RADAR_MMA_WARPS");
+        return e ? std::atoi(e) : 4;
+    }();
+    if (warps >= 8) {
+        gemv_q4k_mma_kernel<8, NTILE>
+            <<<dim3((out / 16 + 7) / 8, grid.y), 8 * 32, 0, stream>>>(w, qs, ds, y, in, out,
+                                                                     ncol, stride);
+    } else {
+        gemv_q4k_mma_kernel<4, NTILE>
+            <<<grid, 4 * 32, 0, stream>>>(w, qs, ds, y, in, out, ncol, stride);
+    }
 }
 
 }  // namespace gpuq
